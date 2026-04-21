@@ -21,7 +21,14 @@ import qrcode
 import re
 from datetime import datetime
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+import sys
+
+if getattr(sys, 'frozen', False):
+    # Running as a PyInstaller EXE
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # Running as a normal Python script
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE = os.path.join(BASE_DIR, "warehouse.xlsx")
 LOG_FILE = os.path.join(BASE_DIR, "activity_log.xlsx")
 QR_FOLDER = os.path.join(BASE_DIR, "qr_codes")
@@ -980,11 +987,11 @@ def _populate_warehouse_tree(df):
         tree_warehouse.insert("", "end", values=tuple(row.get(c, "") for c in ["QR", "Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]))
 
 def search_item():
-    keyword      = search_entry.get().strip().lower()
-    shelf_filter = pull_shelf_var.get()
+    keyword        = search_entry.get().strip().lower()
+    shelf_filter   = pull_shelf_var.get()
     remarks_filter = pull_remarks_var.get()
-    date_from    = w1_date_from_var.get().strip()
-    date_to      = w1_date_to_var.get().strip()
+    date_from      = w1_date_from_var.get().strip()
+    date_to        = w1_date_to_var.get().strip()
 
     df = load_items()
 
@@ -1001,12 +1008,15 @@ def search_item():
 
     df = _filter_by_date(df, date_from, date_to)
     _populate_warehouse_tree(df)
+
+    parts = []
+    if keyword:        parts.append(f"Search: \"{keyword}\"")
     if shelf_filter:   parts.append(f"Shelf: {shelf_filter}")
     if remarks_filter: parts.append(f"Status: {remarks_filter}")
     if date_from:      parts.append(f"From: {date_from}")
     if date_to:        parts.append(f"To: {date_to}")
-    label = (f"{len(df)} result(s)" + (" — " + " | ".join(parts) if parts else "")) if parts else ""
-    w1_search_label.config(text=label)
+    label = f"{len(df)} result(s)" + (" — " + " | ".join(parts) if parts else "")
+    w1_search_label.config(text=label if parts else "")
 
 def filter_pull_history():
     """Filter and display the W1 pull history table only. Completely separate from warehouse search."""
@@ -1019,7 +1029,7 @@ def filter_pull_history():
     tree_pullouts.delete(*tree_pullouts.get_children())
     df = load_pullouts()
     if reason:
-        search_cols = ["Set ID", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+        search_cols = ["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
         mask = False
         for col in search_cols:
             if col in df.columns:
@@ -1910,7 +1920,7 @@ def w2_filter_pull_history():
     tree_w2_pullouts.delete(*tree_w2_pullouts.get_children())
     df = load_pullouts_w2()
     if reason:
-        search_cols = ["Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+        search_cols = ["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
         mask = False
         for col in search_cols:
             if col in df.columns:
