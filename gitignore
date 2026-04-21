@@ -1,0 +1,28 @@
+# ==============================
+# Warehouse Management System
+# .gitignore
+# ==============================
+
+# --- Generated Data Files ---
+warehouse.xlsx
+activity_log.xlsx
+
+# --- Generated Folders (QR codes and labels) ---
+qr_codes/
+qr_labels/
+
+# --- PyInstaller Output ---
+dist/
+build/
+*.spec
+
+# --- Python Cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- OS Junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
