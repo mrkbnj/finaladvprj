@@ -19,6 +19,7 @@ import os
 import uuid
 import qrcode
 import re
+import hashlib
 from datetime import datetime
 
 import sys
@@ -31,12 +32,16 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE = os.path.join(BASE_DIR, "warehouse.xlsx")
 LOG_FILE = os.path.join(BASE_DIR, "activity_log.xlsx")
+USERS_FILE = os.path.join(BASE_DIR, "users.xlsx")
 QR_FOLDER = os.path.join(BASE_DIR, "qr_codes")
 QR_FOLDER_W1 = os.path.join(QR_FOLDER, "warehouse_1")
 QR_FOLDER_W2 = os.path.join(QR_FOLDER, "warehouse_2")
 QR_LABELS_FOLDER = os.path.join(BASE_DIR, "qr_labels")
 QR_LABELS_FOLDER_W1 = os.path.join(QR_LABELS_FOLDER, "warehouse_1")
 QR_LABELS_FOLDER_W2 = os.path.join(QR_LABELS_FOLDER, "warehouse_2")
+EXCEL_FOLDER = os.path.join(BASE_DIR, "excel_exports")
+EXCEL_FOLDER_W1 = os.path.join(EXCEL_FOLDER, "warehouse_1")
+EXCEL_FOLDER_W2 = os.path.join(EXCEL_FOLDER, "warehouse_2")
 
 SHELVES = [
     "Area A", "Area B", "Area C",
@@ -46,19 +51,75 @@ SHELVES = [
 SHELVES_W1 = SHELVES_W2 = SHELVES
 
 EQUIPMENT_TYPES = ["Monitor", "Keyboard", "Mouse", "Headset"]
+STATUS_CHOICES  = ["No Issue", "Minimal", "Defective", "Missing"]
+
+# ========== TOOLTIP ==========
+
+class Tooltip:
+    """Show a single tooltip at a time when the user hovers over a widget."""
+    _active = None  # class-level: only one tooltip visible at a time
+
+    def __init__(self, widget, text):
+        self.widget   = widget
+        self.text     = text
+        self._tip_win = None
+        widget.bind("<Enter>",   self._show)
+        widget.bind("<Leave>",   self._hide)
+        widget.bind("<Destroy>", self._hide)
+
+    def _show(self, event=None):
+        # Close any currently open tooltip first
+        if Tooltip._active and Tooltip._active is not self:
+            Tooltip._active._hide()
+        if self._tip_win or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip_win = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(tw, text=self.text, justify="left",
+                 background="#ffffe0", relief="solid", borderwidth=1,
+                 font=("Helvetica", 8), wraplength=220,
+                 padx=4, pady=3).pack()
+        Tooltip._active = self
+
+    def _hide(self, event=None):
+        tw, self._tip_win = self._tip_win, None
+        if tw:
+            tw.destroy()
+        if Tooltip._active is self:
+            Tooltip._active = None
+
+def tip(widget, text):
+    """Attach a tooltip to widget. Returns the widget for inline use."""
+    Tooltip(widget, text)
+    return widget
 
 staged_items = []
 selected_staged_index = None
 staged_sets = []
 selected_set_index = None
 current_user = ""
+current_is_admin = False
 session_start = ""
+
+# Track last generated Excel paths per warehouse (for VIEW EXCEL button)
+_last_excel_path = {1: None, 2: None}
+
+# ── Checkbox selection state (warehouse table rows) ──────────
+# Maps tree iid -> bool; populated/cleared on every table reload.
+w1_row_checks: dict = {}   # W1 warehouse table checkboxes
+w2_row_checks: dict = {}   # W2 warehouse table checkboxes
+w1_pull_row_checks: dict = {}  # W1 pull history table checkboxes
+w2_pull_row_checks: dict = {}  # W2 pull history table checkboxes
 
 # ========== INITIALIZATION ==========
 
 def initialize_file():
     # Always ensure all folders exist
-    for folder in (QR_FOLDER_W1, QR_FOLDER_W2, QR_LABELS_FOLDER_W1, QR_LABELS_FOLDER_W2):
+    for folder in (QR_FOLDER_W1, QR_FOLDER_W2, QR_LABELS_FOLDER_W1, QR_LABELS_FOLDER_W2,
+                   EXCEL_FOLDER_W1, EXCEL_FOLDER_W2):
         os.makedirs(folder, exist_ok=True)
 
     sheets_to_create = {}
@@ -82,19 +143,22 @@ def initialize_file():
 
     default_dfs = {
         # W1 Sheets
-        "items": pd.DataFrame(columns=["QR", "Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]),
+        "items": pd.DataFrame(columns=["QR", "Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]),
         "shelves": pd.DataFrame({"Shelf": SHELVES_W1, "Status": ["AVAILABLE"] * len(SHELVES_W1), "Date_Full": [None] * len(SHELVES_W1)}),
-        "pullouts": pd.DataFrame(columns=["Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]),
+        "pullouts": pd.DataFrame(columns=["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]),
 
         # W2 Sheets
-        "items_w2": pd.DataFrame(columns=["QR", "Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]),
+        "items_w2": pd.DataFrame(columns=["QR", "Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]),
         "shelves_w2": pd.DataFrame({"Shelf": SHELVES_W2, "Status": ["AVAILABLE"] * len(SHELVES_W2), "Date_Full": [None] * len(SHELVES_W2)}),
-        "pullouts_w2": pd.DataFrame(columns=["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]),
+        "pullouts_w2": pd.DataFrame(columns=["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]),
     }
     try:
         with pd.ExcelWriter(FILE, engine='openpyxl', mode=mode) as writer:
             for sheet in sheets_to_create:
                 default_dfs[sheet].to_excel(writer, sheet_name=sheet, index=False)
+            for ws in writer.book.worksheets:
+                ws.protection.sheet = True
+                ws.protection.enable()
     except Exception as e:
         messagebox.showerror("File Error", f"Could not create '{FILE}':\n{e}\n\nMake sure the file is not open in Excel.")
 
@@ -102,16 +166,155 @@ def initialize_log():
     if not os.path.exists(LOG_FILE):
         with pd.ExcelWriter(LOG_FILE, engine='openpyxl') as writer:
             pd.DataFrame(columns=["Timestamp", "User", "Action", "Details"]).to_excel(writer, sheet_name="logs", index=False)
+            for ws in writer.book.worksheets:
+                ws.protection.sheet = True
+                ws.protection.enable()
 
-# ========== LOAD / SAVE ==========
+# ========== USERS DATABASE ==========
+
+def _hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+def _is_admin_password(pw: str) -> bool:
+    """Admin passwords must contain at least one of: ! @ #"""
+    return bool(re.search(r'[!@#]', pw))
+
+def initialize_users():
+    """Create users.xlsx with a default admin account if it doesn't exist."""
+    if not os.path.exists(USERS_FILE):
+        default_pw = "Admin@123"          # contains @  → admin role
+        df = pd.DataFrame([{
+            "Username": "admin",
+            "Password": _hash_password(default_pw),
+            "Role":     "admin",
+            "Created":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+        with pd.ExcelWriter(USERS_FILE, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="users", index=False)
+            for ws in writer.book.worksheets:
+                ws.protection.sheet = True
+                ws.protection.enable()
+
+def load_users() -> pd.DataFrame:
+    """Return the users DataFrame (always with expected columns)."""
+    initialize_users()
+    from openpyxl import load_workbook
+    wb = load_workbook(USERS_FILE, data_only=True)
+    ws = wb["users"]
+    ws.protection.sheet = False
+    import tempfile
+    tmp = USERS_FILE + ".~tmp.xlsx"
+    wb.save(tmp)
+    df = pd.read_excel(tmp, sheet_name="users")
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    for col in ["Username", "Password", "Role", "Created"]:
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+def _save_users(df: pd.DataFrame):
+    with pd.ExcelWriter(USERS_FILE, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="users", index=False)
+        for ws in writer.book.worksheets:
+            ws.protection.sheet = True
+            ws.protection.enable()
+
+def authenticate_user(username: str, password: str):
+    """Return (ok, role) or (False, None)."""
+    df = load_users()
+    row = df[df["Username"].str.lower() == username.strip().lower()]
+    if row.empty:
+        return False, None
+    stored_hash = str(row.iloc[0]["Password"])
+    if stored_hash != _hash_password(password):
+        return False, None
+    role = str(row.iloc[0].get("Role", "user")).lower()
+    return True, role
+
+def create_account(username: str, password: str) -> str:
+    """Create a new account. Returns error string or '' on success."""
+    username = username.strip()
+    if not username:
+        return "Username cannot be empty."
+    if len(username) < 3:
+        return "Username must be at least 3 characters."
+    if not re.match(r'^[A-Za-z0-9_]+$', username):
+        return "Username may only contain letters, digits, and underscores."
+    if len(password) < 6:
+        return "Password must be at least 6 characters."
+    df = load_users()
+    if username.lower() in df["Username"].str.lower().tolist():
+        return f"Username '{username}' already exists."
+    role = "admin" if _is_admin_password(password) else "user"
+    new_row = pd.DataFrame([{
+        "Username": username,
+        "Password": _hash_password(password),
+        "Role":     role,
+        "Created":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }])
+    df = pd.concat([df, new_row], ignore_index=True)
+    _save_users(df)
+    return ""
+
+def delete_account(username: str) -> str:
+    """Delete account by username. Returns error string or '' on success."""
+    df = load_users()
+    match = df[df["Username"].str.lower() == username.strip().lower()]
+    if match.empty:
+        return f"Account '{username}' not found."
+    if str(match.iloc[0]["Role"]).lower() == "admin":
+        # prevent deleting the last admin
+        remaining_admins = df[df["Role"].str.lower() == "admin"]
+        if len(remaining_admins) <= 1:
+            return "Cannot delete the only admin account."
+    df = df[df["Username"].str.lower() != username.strip().lower()].reset_index(drop=True)
+    _save_users(df)
+    return ""
+
+def change_password(username: str, new_password: str) -> str:
+    """Change password and update role. Returns error string or '' on success."""
+    if len(new_password) < 6:
+        return "Password must be at least 6 characters."
+    df = load_users()
+    idx = df[df["Username"].str.lower() == username.strip().lower()].index
+    if idx.empty:
+        return f"Account '{username}' not found."
+    i = idx[0]
+    df.at[i, "Password"] = _hash_password(new_password)
+    df.at[i, "Role"]     = "admin" if _is_admin_password(new_password) else "user"
+    _save_users(df)
+    return ""
+
+
 
 def _load_sheet(file, sheet, init_fn):
+    def _read():
+        # Read with openpyxl and strip sheet protection so data loads correctly
+        from openpyxl import load_workbook
+        wb = load_workbook(file, data_only=True)
+        if sheet not in wb.sheetnames:
+            raise ValueError(f"Sheet '{sheet}' not found")
+        ws = wb[sheet]
+        ws.protection.sheet = False   # temporarily lift for pandas
+        import tempfile, os
+        tmp = file + ".~tmp.xlsx"
+        wb.save(tmp)
+        df = pd.read_excel(tmp, sheet_name=sheet)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return df
+
     try:
-        return pd.read_excel(file, sheet_name=sheet)
+        return _read()
     except Exception:
         try:
             init_fn()
-            return pd.read_excel(file, sheet_name=sheet)
+            return _read()
         except Exception as e:
             messagebox.showerror("File Error",
                 f"Could not load sheet '{sheet}' from '{file}':\n{e}\n\n"
@@ -120,7 +323,7 @@ def _load_sheet(file, sheet, init_fn):
 
 def load_items():
     df = _load_sheet(FILE, "items", initialize_file)
-    expected = ["QR", "Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+    expected = ["QR", "Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
     for col in expected:
         if col not in df.columns:
             df[col] = pd.Series(dtype=str)
@@ -128,7 +331,13 @@ def load_items():
 def load_shelves():     return _load_sheet(FILE, "shelves", initialize_file) # W1 Only
 def load_shelves_w2():  return _load_sheet(FILE, "shelves_w2", initialize_file) # W2 Only
 def load_pullouts():    return _load_sheet(FILE, "pullouts", initialize_file)
-def load_items_w2():    return _load_sheet(FILE, "items_w2", initialize_file)
+def load_items_w2():
+    df = _load_sheet(FILE, "items_w2", initialize_file)
+    expected = ["QR", "Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype=str)
+    return df
 def load_pullouts_w2(): return _load_sheet(FILE, "pullouts_w2", initialize_file)
 def load_logs():        return _load_sheet(LOG_FILE, "logs", initialize_log)
 
@@ -149,6 +358,9 @@ def _write_all_sheets(df_items, df_shelves, df_pullouts, df_items_w2, df_shelves
             df_items_w2.to_excel(writer,  sheet_name="items_w2",    index=False)
             df_shelves_w2.to_excel(writer,sheet_name="shelves_w2",  index=False)
             df_po2.to_excel(writer,       sheet_name="pullouts_w2", index=False)
+            for ws in writer.book.worksheets:
+                ws.protection.sheet = True
+                ws.protection.enable()
     except PermissionError:
         _excel_locked_error()
         raise
@@ -172,6 +384,9 @@ def save_log(action, details=""):
     df_log = pd.concat([df_log, pd.DataFrame([new_row])], ignore_index=True)
     with pd.ExcelWriter(LOG_FILE, engine='openpyxl') as writer:
         df_log.to_excel(writer, sheet_name="logs", index=False)
+        for ws in writer.book.worksheets:
+            ws.protection.sheet = True
+            ws.protection.enable()
 
 # ========== QR HELPERS ==========
 
@@ -210,19 +425,19 @@ def pick_date(parent, target_var, title="Select Date"):
 
     header = tk.Frame(cal_win, bg="#2c3e50")
     header.pack(fill="x")
-    prev_btn = tk.Button(header, text="◀", bg="#2c3e50", fg="white", bd=0, font=("Arial", 10),
+    prev_btn = tk.Button(header, text="◀", bg="#2c3e50", fg="white", bd=0, font=("Helvetica", 10),
                          command=lambda: _change_month(-1))
     prev_btn.pack(side="left", padx=8, pady=4)
-    month_lbl = tk.Label(header, text="", bg="#2c3e50", fg="white", font=("Arial", 10, "bold"), width=16)
+    month_lbl = tk.Label(header, text="", bg="#2c3e50", fg="white", font=("Helvetica", 10, "bold"), width=16)
     month_lbl.pack(side="left", expand=True)
-    next_btn = tk.Button(header, text="▶", bg="#2c3e50", fg="white", bd=0, font=("Arial", 10),
+    next_btn = tk.Button(header, text="▶", bg="#2c3e50", fg="white", bd=0, font=("Helvetica", 10),
                          command=lambda: _change_month(1))
     next_btn.pack(side="right", padx=8, pady=4)
 
     day_names = tk.Frame(cal_win, bg="#dce3f0")
     day_names.pack(fill="x")
     for i, d in enumerate(["Su","Mo","Tu","We","Th","Fr","Sa"]):
-        tk.Label(day_names, text=d, width=4, font=("Arial", 8, "bold"),
+        tk.Label(day_names, text=d, width=4, font=("Helvetica", 8, "bold"),
                  bg="#dce3f0", fg="#2c3e50").grid(row=0, column=i, padx=2, pady=3)
 
     grid_frame = tk.Frame(cal_win, bg="white", padx=4, pady=4)
@@ -250,7 +465,7 @@ def pick_date(parent, target_var, title="Select Date"):
                     is_today = (day == today.day and m == today.month and y == today.year)
                     btn = tk.Button(
                         grid_frame, text=str(day), width=4,
-                        font=("Arial", 9, "bold" if is_today else "normal"),
+                        font=("Helvetica", 9, "bold" if is_today else "normal"),
                         bg="#2980b9" if is_today else "white",
                         fg="white" if is_today else "#2c3e50",
                         relief="flat", cursor="hand2",
@@ -266,7 +481,7 @@ def pick_date(parent, target_var, title="Select Date"):
     # "Clear" button
     clear_frame = tk.Frame(cal_win)
     clear_frame.pack(fill="x", pady=(0, 4))
-    tk.Button(clear_frame, text="Clear date", fg="gray", bd=0, font=("Arial", 8),
+    tk.Button(clear_frame, text="Clear date", fg="gray", bd=0, font=("Helvetica", 8),
               command=lambda: [target_var.set(""), cal_win.destroy()]).pack()
 
     _draw()
@@ -284,7 +499,7 @@ def _date_picker_widget(parent, var, label_text):
     frame = tk.Frame(parent)
     tk.Label(frame, text=label_text).pack(side="left", padx=(0, 2))
     date_lbl = tk.Label(frame, textvariable=var, width=11, relief="sunken",
-                        bg="white", font=("Arial", 9), anchor="w", padx=4)
+                        bg="white", font=("Helvetica", 9), anchor="w", padx=4)
     date_lbl.pack(side="left", padx=(0, 2))
     tk.Button(frame, text="📅", width=2,
               command=lambda: pick_date(parent.winfo_toplevel(), var)).pack(side="left")
@@ -328,13 +543,12 @@ def select_staged_item(event):
     index = selection[0]
     selected_staged_index = index
     item = staged_items[index]
-    _fill_input_fields(item["Hostname"], item.get("Brand/Model", ""), item.get("Serial Number", ""), item.get("Checked By", ""), item["Shelf"], item.get("Status", ""), item.get("Remarks", ""))
+    _fill_input_fields(item["Hostname"], item.get("Serial Number", ""), item.get("Checked By", ""), item["Shelf"], item.get("Status", ""), item.get("Remarks", ""))
 
 # ========== W1 INPUT HELPERS ==========
 
-def _fill_input_fields(hostname="", brand="", serial="", checked_by="", shelf="", status="", remarks=""):
+def _fill_input_fields(hostname="", serial="", checked_by="", shelf="", status="", remarks=""):
     hostname_entry.delete(0, tk.END);   hostname_entry.insert(0, hostname)
-    brand_entry.delete(0, tk.END);      brand_entry.insert(0, brand)
     serial_entry.delete(0, tk.END);     serial_entry.insert(0, serial)
     checked_by_entry.delete(0, tk.END); checked_by_entry.insert(0, checked_by)
     shelf_var.set(shelf)
@@ -372,7 +586,6 @@ def remove_from_staging():
 
 def put_item():
     hostname   = hostname_entry.get().strip()
-    brand      = brand_entry.get().strip()
     shelf      = shelf_var.get()
     serial     = serial_entry.get().strip()
     checked_by = checked_by_entry.get().strip()
@@ -381,8 +594,6 @@ def put_item():
 
     if not hostname:
         messagebox.showerror("Error", "Please enter a Hostname"); return
-    if not brand:
-        messagebox.showerror("Error", "Please enter a Brand/Model"); return
     if not serial:
         messagebox.showerror("Error", "Please enter a Serial Number"); return
     if not checked_by:
@@ -417,7 +628,6 @@ def put_item():
 
     staged_items.append({
         "Hostname":      hostname,
-        "Brand/Model":   brand,
         "Serial Number": serial,
         "Checked By":    checked_by,
         "Shelf":         shelf,
@@ -437,27 +647,17 @@ def put_warehouse():
     try:
         df_items = load_items()
         df_shelves = load_shelves()
-        for col in ["Brand/Model", "Serial Number", "Checked By"]:
+        for col in ["Serial Number", "Checked By"]:
             if col not in df_items.columns:
                 df_items[col] = ""
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for item in staged_items:
             qr_code = str(uuid.uuid4())
-            generate_qr(item['Hostname'], (
-                f"Hostname: {item['Hostname']}\n"
-                f"Brand/Model: {item.get('Brand/Model', '')}\n"
-                f"Serial Number: {item.get('Serial Number', '')}\n"
-                f"Checked By: {item.get('Checked By', '')}\n"
-                f"Shelf: {item['Shelf']}\n"
-                f"Status: {item.get('Status', '')}\n"
-                f"Remarks: {item.get('Remarks', '')}\n"
-                f"Date: {now_str}"
-            ), warehouse=1)
+            generate_qr(item['Hostname'], item['Hostname'], warehouse=1)
             df_items = pd.concat([df_items, pd.DataFrame([{
                 "QR": qr_code,
                 "Hostname": item['Hostname'],
-                "Brand/Model": item.get('Brand/Model', ''),
                 "Serial Number": item.get('Serial Number', ''),
                 "Checked By": item.get('Checked By', ''),
                 "Shelf": item['Shelf'],
@@ -468,18 +668,12 @@ def put_warehouse():
 
         save_warehouse_1(df_items, df_shelves)
 
-        try:
-            pdf_path = generate_qr_pdf([{**item, '_warehouse': 1} for item in staged_items])
-            pdf_msg = f"\nQR labels saved to:\n{pdf_path}"
-        except Exception as pdf_err:
-            pdf_msg = f"\nPDF generation failed: {pdf_err}"
-
         count = len(staged_items)
         for item in staged_items:
             save_log("PUT WAREHOUSE", f"[W1] Hostname: {item['Hostname']} | Shelf: {item['Shelf']}")
 
         staged_items.clear()
-        messagebox.showinfo("Success", f"{count} item(s) added to Warehouse 1{pdf_msg}")
+        messagebox.showinfo("Success", f"{count} item(s) added to Warehouse 1.\nQR codes generated.\nUse 'GENERATE FILES' to create PDF labels and export to Excel.")
         update_staged_display()
         w1_refresh_all()
 
@@ -493,7 +687,6 @@ def put_warehouse():
 def update_item():
     global selected_staged_index
     new_hostname   = hostname_entry.get().strip()
-    new_brand      = brand_entry.get().strip()
     new_serial     = serial_entry.get().strip()
     new_checked_by = checked_by_entry.get().strip()
     new_shelf      = shelf_var.get()
@@ -502,8 +695,6 @@ def update_item():
 
     if not new_hostname:
         messagebox.showerror("Error", "Hostname cannot be empty"); return
-    if not new_brand:
-        messagebox.showerror("Error", "Brand/Model cannot be empty"); return
     if not new_serial:
         messagebox.showerror("Error", "Serial Number cannot be empty"); return
     if not new_checked_by:
@@ -536,7 +727,6 @@ def update_item():
                     f"Hostname: {match['Hostname']} | Shelf: {match['Shelf']}"); return
         staged_items[index].update({
             "Hostname":      new_hostname,
-            "Brand/Model":   new_brand,
             "Serial Number": new_serial,
             "Checked By":    new_checked_by,
             "Shelf":         new_shelf,
@@ -561,14 +751,14 @@ def delete_item():
 
     df_items = load_items()
     df_shelves = load_shelves()
-    index = tree_warehouse.index(selected[0])
-    hostname = df_items.at[index, "Hostname"]
+    # values: ☐(0), QR(1), Hostname(2), Serial(3), Checked By(4), Shelf(5), Status(6), Remarks(7), Date(8)
+    hostname = tree_warehouse.item(selected[0], "values")[2]
 
     if not messagebox.askyesno("Confirm Delete", f"Delete '{hostname}'?\nThis cannot be undone."):
         return
 
     delete_qr(hostname, warehouse=1)
-    df_items = df_items.drop(index).reset_index(drop=True)
+    df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
     save_warehouse_1(df_items, df_shelves)
     save_log("DELETE ITEM", f"[W1] Hostname: {hostname}")
     messagebox.showinfo("Deleted", "Record and QR code deleted")
@@ -581,6 +771,7 @@ def pull_search_live(event=None):
     if tree_available.winfo_ismapped():
         # Shelf status view is active
         df = load_shelves().sort_values("Shelf")
+        df_items_all = load_items()
         if keyword:
             mask = False
             for col in ["Shelf", "Status", "Date_Full"]:
@@ -589,31 +780,46 @@ def pull_search_live(event=None):
             df = df[mask]
         tree_available.delete(*tree_available.get_children())
         for _, row in df.iterrows():
-            date_full = row.get("Date_Full", "")
-            tree_available.insert("", "end", values=(row["Shelf"], row["Status"], date_full if pd.notna(date_full) else ""))
+            date_full  = row.get("Date_Full", "")
+            shelf_name = row["Shelf"]
+            item_count = int((df_items_all["Shelf"] == shelf_name).sum()) if "Shelf" in df_items_all.columns else 0
+            tree_available.insert("", "end", values=(shelf_name, row["Status"], item_count, date_full if pd.notna(date_full) else ""))
         w1_search_label.config(text=f"{len(df)} match(es)" if keyword else "")
 
     elif tree_pullouts.winfo_ismapped():
-        # Pull history view is active
+        # Pull history view is active — respect all active filters
         df = load_pullouts()
+        shelf_filter   = pull_shelf_var.get()
+        remarks_filter = pull_remarks_var.get()
+        date_from      = w1_date_from_var.get().strip()
+        date_to        = w1_date_to_var.get().strip()
         if keyword:
-            search_cols = ["Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+            search_cols = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
             mask = False
             for col in search_cols:
                 if col in df.columns:
                     mask = mask | df[col].astype(str).str.lower().str.contains(keyword, na=False)
             df = df[mask]
+        if shelf_filter:   df = df[df["Shelf"] == shelf_filter]
+        if remarks_filter: df = df[df["Status"] == remarks_filter]
+        df = _filter_by_date(df, date_from, date_to)
         tree_pullouts.delete(*tree_pullouts.get_children())
+        w1_pull_row_checks.clear()
         for _, row in df.iterrows():
-            tree_pullouts.insert("", "end", values=tuple(row.get(c, "") for c in ["Hostname", "Brand/Model", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]))
-        w1_search_label.config(text=f"{len(df)} match(es)" if keyword else "")
+            iid = tree_pullouts.insert("", "end", values=(
+                "☐",
+                *tuple(row.get(c, "") for c in ["Hostname", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+            ))
+            w1_pull_row_checks[iid] = False
+        active = bool(keyword or shelf_filter or remarks_filter or date_from or date_to)
+        w1_search_label.config(text=f"{len(df)} match(es)" if active else "", fg="darkorange" if active else "blue")
 
     else:
         # Warehouse view (default)
         show_warehouse()
         if keyword:
             df = load_items()
-            search_cols = ["QR", "Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+            search_cols = ["QR", "Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
             mask = False
             for col in search_cols:
                 if col in df.columns:
@@ -657,7 +863,6 @@ def pull_item():
     df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
     df_pullouts = pd.concat([df_pullouts, pd.DataFrame([{
         "Hostname": hostname,
-        "Brand/Model": str(item_row.get("Brand/Model", "")),
         "Serial Number": str(item_row.get("Serial Number", "")),
         "Checked By": str(item_row.get("Checked By", "")),
         "Shelf": shelf,
@@ -674,83 +879,109 @@ def pull_item():
     pull_reason_filter_var.set("")
     w1_refresh_all()
 
-def undo_pull(event):
-    item_id = tree_pullouts.identify_row(event.y)
-    if not item_id:
+def undo_pull(event=None):
+    # Collect checked rows; fall back to treeview selection if nothing checked
+    checked = [iid for iid, state in w1_pull_row_checks.items() if state]
+    if not checked:
+        sel = tree_pullouts.selection()
+        if sel:
+            checked = [sel[0]]
+    if not checked:
+        messagebox.showinfo("Back to Warehouse", "Check at least one row in the Pull History table.")
         return
-    values = tree_pullouts.item(item_id, "values")
-    if not values:
-        return
 
-    hostname, brand, shelf, status, remarks = values[0], values[1], values[2], values[3], values[4]
-    if not messagebox.askyesno("Undo Pull", f"Restore '{hostname}' back to the warehouse?\n\nShelf: {shelf}\nStatus: {status}"):
-        return
+    restored = 0
+    for item_id in checked:
+        values = tree_pullouts.item(item_id, "values")
+        if not values:
+            continue
+        # values: ☐(0), Hostname(1), Serial(2), Shelf(3), Status(4), Remarks(5), PullReason(6), Date(7)
+        hostname, shelf, status, remarks = values[1], values[3], values[4], values[5]
+        if not messagebox.askyesno("Undo Pull", f"Restore '{hostname}' back to the warehouse?\n\nShelf: {shelf}\nStatus: {status}"):
+            continue
 
-    df_items = load_items()
-    df_shelves = load_shelves()
-    df_pullouts = load_pullouts()
+        df_items = load_items()
+        df_shelves = load_shelves()
+        df_pullouts = load_pullouts()
 
-    if hostname in df_items["Hostname"].values:
-        messagebox.showerror("Error", f"'{hostname}' already exists in warehouse"); return
+        if hostname in df_items["Hostname"].values:
+            messagebox.showerror("Error", f"'{hostname}' already exists in warehouse")
+            continue
 
-    match = df_pullouts[df_pullouts["Hostname"] == hostname]
-    if match.empty:
-        messagebox.showerror("Error", f"'{hostname}' not found in pull history"); return
+        match = df_pullouts[df_pullouts["Hostname"] == hostname]
+        if match.empty:
+            messagebox.showerror("Error", f"'{hostname}' not found in pull history")
+            continue
 
-    pull_row = match.iloc[0]
-    qr_code = ""
-    try:
-        qr_code = str(uuid.uuid4())
-        generate_qr(hostname, qr_code, warehouse=1)
-    except Exception as e:
-        messagebox.showwarning("Warning", f"QR code not regenerated: {e}")
+        pull_row = match.iloc[0]
+        qr_code = ""
+        try:
+            qr_code = str(uuid.uuid4())
+            generate_qr(hostname, qr_code, warehouse=1)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"QR code not regenerated: {e}")
 
-    for col in ["Brand/Model", "Serial Number", "Checked By"]:
-        if col not in df_items.columns:
-            df_items[col] = ""
+        for col in ["Serial Number", "Checked By"]:
+            if col not in df_items.columns:
+                df_items[col] = ""
 
-    df_items = pd.concat([df_items, pd.DataFrame([{
-        "QR": qr_code,
-        "Hostname": hostname,
-        "Brand/Model": str(pull_row.get("Brand/Model", "")),
-        "Serial Number": str(pull_row.get("Serial Number", "")),
-        "Checked By": str(pull_row.get("Checked By", "")),
-        "Shelf": shelf,
-        "Status": status,
-        "Remarks": remarks,
-        "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }])], ignore_index=True)
+        df_items = pd.concat([df_items, pd.DataFrame([{
+            "QR": qr_code,
+            "Hostname": hostname,
+            "Serial Number": str(pull_row.get("Serial Number", "")),
+            "Checked By": str(pull_row.get("Checked By", "")),
+            "Shelf": shelf,
+            "Status": status,
+            "Remarks": remarks,
+            "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }])], ignore_index=True)
 
-    df_pullouts = df_pullouts[df_pullouts["Hostname"] != hostname].reset_index(drop=True)
-    save_warehouse_1(df_items, df_shelves, df_pullouts)
-    save_log("UNDO PULL", f"[W1] Hostname: {hostname} | Shelf: {shelf}")
-    messagebox.showinfo("Restored", f"'{hostname}' has been restored to the warehouse")
+        df_pullouts = df_pullouts[df_pullouts["Hostname"] != hostname].reset_index(drop=True)
+        save_warehouse_1(df_items, df_shelves, df_pullouts)
+        save_log("UNDO PULL", f"[W1] Hostname: {hostname} | Shelf: {shelf}")
+        restored += 1
+
+    if restored:
+        messagebox.showinfo("Restored", f"{restored} item(s) restored to Warehouse 1.")
     show_pullouts()
 
-def unstage_from_warehouse(event):
-    item_id = tree_warehouse.identify_row(event.y)
-    if not item_id:
-        return
-    values = tree_warehouse.item(item_id, "values")
-    if not values:
+def unstage_from_warehouse(event=None):
+    # Collect checked rows; fall back to treeview selection if nothing checked
+    checked = [iid for iid, state in w1_row_checks.items() if state]
+    if not checked:
+        sel = tree_warehouse.selection()
+        if sel:
+            checked = [sel[0]]
+    if not checked:
+        messagebox.showinfo("Back to Stage", "Check at least one row in the Warehouse table.")
         return
 
-    hostname, brand, serial, checked_by, shelf, status, remarks = values[1], values[2], values[3], values[4], values[5], values[6], values[7]
-    if not messagebox.askyesno("Move to Staging", f"Move '{hostname}' back to staging?\n\nShelf: {shelf}\nStatus: {status}"):
-        return
-    if any(item['Hostname'] == hostname for item in staged_items):
-        messagebox.showerror("Error", f"'{hostname}' is already in staging"); return
+    moved = 0
+    for item_id in checked:
+        values = tree_warehouse.item(item_id, "values")
+        if not values:
+            continue
+        # values: ☐(0), QR(1), Hostname(2), Serial(3), Checked By(4), Shelf(5), Status(6), Remarks(7), Date(8)
+        hostname, serial, checked_by, shelf, status, remarks = values[2], values[3], values[4], values[5], values[6], values[7]
+        if not messagebox.askyesno("Move to Staging", f"Move '{hostname}' back to staging?\n\nShelf: {shelf}\nStatus: {status}"):
+            continue
+        if any(item['Hostname'] == hostname for item in staged_items):
+            messagebox.showerror("Error", f"'{hostname}' is already in staging")
+            continue
 
-    df_items = load_items()
-    df_shelves = load_shelves()
-    delete_qr(hostname, warehouse=1)
-    df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
-    save_warehouse_1(df_items, df_shelves)
-    staged_items.append({"Hostname": hostname, "Brand/Model": brand, "Serial Number": serial, "Checked By": checked_by, "Shelf": shelf, "Status": status, "Remarks": remarks})
-    save_log("UNSTAGE", f"[W1] Hostname: {hostname} | Shelf: {shelf}")
-    messagebox.showinfo("Moved", f"'{hostname}' moved back to staging")
-    update_staged_display()
-    w1_refresh_all()
+        df_items = load_items()
+        df_shelves = load_shelves()
+        delete_qr(hostname, warehouse=1)
+        df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
+        save_warehouse_1(df_items, df_shelves)
+        staged_items.append({"Hostname": hostname, "Serial Number": serial, "Checked By": checked_by, "Shelf": shelf, "Status": status, "Remarks": remarks})
+        save_log("UNSTAGE", f"[W1] Hostname: {hostname} | Shelf: {shelf}")
+        moved += 1
+
+    if moved:
+        messagebox.showinfo("Moved", f"{moved} item(s) moved back to staging.")
+        update_staged_display()
+        w1_refresh_all()
 
 # ========== W1 SHELF MANAGEMENT ==========
 
@@ -826,21 +1057,24 @@ def _show_tree(tree):
             t.pack_forget()
     tree.pack(fill="both", expand=True)
 
-def _open_qr_gallery(warehouse):
-    """Shared QR gallery window for both warehouses."""
+def _open_qr_gallery(warehouse, filter_keys=None):
+    """Shared QR gallery window for both warehouses.
+    filter_keys: if provided, only show items whose QR key is in this list.
+    """
     from PIL import Image, ImageTk
     wh_label = f"Warehouse {warehouse}"
     bg_color = "#2c3e50" if warehouse == 1 else "#1a5276"
     btn_color = "#1a252f" if warehouse == 1 else "#154360"
 
     qr_win = tk.Toplevel(root)
-    qr_win.title(f"Stored QR Codes — {wh_label}")
+    qr_win.title(f"Stored QR Codes — {wh_label}"
+                 + (f"  [{len(filter_keys)} selected]" if filter_keys else ""))
     qr_win.geometry("860x560")
 
     toolbar = tk.Frame(qr_win, bg=bg_color)
     toolbar.pack(fill="x")
     tk.Label(toolbar, text=f"Stored QR Codes — {wh_label}",
-             bg=bg_color, fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=10, pady=6)
+             bg=bg_color, fg="white", font=("Helvetica", 10, "bold")).pack(side="left", padx=10, pady=6)
     search_var = tk.StringVar()
     tk.Label(toolbar, text="Search:", bg=bg_color, fg="white").pack(side="left", padx=(20, 2))
     tk.Entry(toolbar, textvariable=search_var, width=18).pack(side="left", pady=4)
@@ -877,9 +1111,9 @@ def _open_qr_gallery(warehouse):
                 shelf = str(row.get("Shelf", ""))
                 path  = qr_path_for(key, warehouse=1)
                 kw_fields = [key, shelf]
-                cell_labels = [(key, ("Arial", 8, "bold"), "#2c3e50", 0),
-                               (f"S/N: {sub}", ("Arial", 7), "#555", 0),
-                               (f"Shelf: {shelf}", ("Arial", 7), "gray", 0)]
+                cell_labels = [(key, ("Helvetica", 8, "bold"), "#2c3e50", 0),
+                               (f"S/N: {sub}", ("Helvetica", 7), "#555", 0),
+                               (f"Shelf: {shelf}", ("Helvetica", 7), "gray", 0)]
             else:
                 set_id  = str(row.get("Set ID", ""))
                 eq_type = str(row.get("Equipment Type", ""))
@@ -889,11 +1123,15 @@ def _open_qr_gallery(warehouse):
                 host    = str(row.get("Hostname", ""))
                 path    = qr_path_for(key, warehouse=2)
                 kw_fields = [set_id, eq_type, shelf]
-                cell_labels = [(key, ("Arial", 8, "bold"), "#2c3e50", 0),
-                               (host, ("Arial", 7, "italic"), "#2c3e50", 0),
-                               (f"S/N: {sub}", ("Arial", 7), "#555", 0),
-                               (f"Shelf: {shelf}", ("Arial", 7), "gray", 0)]
+                cell_labels = [(key, ("Helvetica", 8, "bold"), "#2c3e50", 0),
+                               (host, ("Helvetica", 7, "italic"), "#2c3e50", 0),
+                               (f"S/N: {sub}", ("Helvetica", 7), "#555", 0),
+                               (f"Shelf: {shelf}", ("Helvetica", 7), "gray", 0)]
 
+            # Filter by selection keys (from Stored QR button) first,
+            # then by the gallery's own search box
+            if filter_keys is not None and key not in filter_keys:
+                continue
             if keyword and not any(keyword.lower() in f.lower() for f in kw_fields):
                 continue
 
@@ -909,7 +1147,7 @@ def _open_qr_gallery(warehouse):
                     tk.Label(cell, text="[Error]", bg="white", fg="red", width=14).pack()
             else:
                 tk.Label(cell, text="[No QR File]", bg="#fdf2f2", fg="#c0392b",
-                         width=14, height=6, font=("Arial", 8)).pack()
+                         width=14, height=6, font=("Helvetica", 8)).pack()
             for text, font, fg, _ in cell_labels:
                 tk.Label(cell, text=text, bg="white", font=font, fg=fg, wraplength=130).pack(pady=(4,0) if _ == 0 else 0)
 
@@ -919,7 +1157,7 @@ def _open_qr_gallery(warehouse):
 
         if shown == 0:
             tk.Label(inner, text="No QR codes found.", bg="#f4f6f7",
-                     font=("Arial", 10), fg="gray").grid(row=0, column=0, padx=20, pady=40)
+                     font=("Helvetica", 10), fg="gray").grid(row=0, column=0, padx=20, pady=40)
         count_lbl.config(text=f"{shown} QR code(s)")
         inner.update_idletasks()
         canvas_qr.configure(scrollregion=canvas_qr.bbox("all"))
@@ -932,11 +1170,712 @@ def _open_qr_gallery(warehouse):
 def show_qr_codes():    _open_qr_gallery(warehouse=1)
 def w2_show_qr_codes(): _open_qr_gallery(warehouse=2)
 
+# ── Checkbox helpers ──────────────────────────────────────────
+
+def _get_w1_selected_rows():
+    """Return list of row-value tuples for checked (or all) W1 warehouse rows.
+    w1_row_checks maps iid -> bool (plain bool, not BooleanVar)."""
+    checked = [iid for iid, state in w1_row_checks.items() if state]
+    if checked:
+        return [tree_warehouse.item(iid, "values") for iid in checked]
+    # Fall back to all visible rows when nothing is explicitly checked
+    return [tree_warehouse.item(iid, "values") for iid in tree_warehouse.get_children()]
+
+def _get_w2_selected_rows():
+    """Return list of row-value tuples for checked (or all) W2 warehouse rows.
+    w2_row_checks maps iid -> bool (plain bool, not BooleanVar)."""
+    checked = [iid for iid, state in w2_row_checks.items() if state]
+    if checked:
+        return [tree_w2_warehouse.item(iid, "values") for iid in checked]
+    return [tree_w2_warehouse.item(iid, "values") for iid in tree_w2_warehouse.get_children()]
+
+def generate_stored_qr(warehouse=1):
+    """Generate QR PNGs for selected/filtered items, open the QR gallery filtered
+    to those items, and write a 'qr_selection_w1' / 'qr_selection_w2' sheet to
+    the warehouse Excel with the details of those items.
+
+    W1 column layout: ☐(0), QR(1), Hostname(2), Serial(3), Checked By(4), Shelf(5), Status(6), Remarks(7), Date(8)
+    W2 column layout: ☐(0), QR(1), Set ID(2), Hostname(3), Equip Type(4), Serial(5), Checked By(6), Shelf(7), Status(8), Remarks(9), Date(10)
+    """
+    if warehouse == 1:
+        rows = _get_w1_selected_rows()
+    else:
+        rows = _get_w2_selected_rows()
+
+    if not rows:
+        messagebox.showinfo("Stored QR", "No items to generate QR codes for.")
+        return
+
+    # ── 1. Generate QR PNGs ───────────────────────────────────
+    count_ok = count_skip = 0
+    qr_keys = []   # track keys generated so the gallery can filter to them
+
+    for values in rows:
+        try:
+            if warehouse == 1:
+                hostname = str(values[2])
+                generate_qr(hostname, hostname, warehouse=1)
+                qr_keys.append(hostname)
+            else:
+                set_id  = str(values[2])
+                eq_type = str(values[4])
+                qr_key  = f"{set_id}-{eq_type}"
+                generate_qr(qr_key, qr_key, warehouse=2)
+                qr_keys.append(qr_key)
+            count_ok += 1
+        except Exception:
+            count_skip += 1
+
+    if count_skip:
+        messagebox.showwarning(
+            "Generate Files",
+            f"{count_ok} QR code(s) generated.\n{count_skip} item(s) skipped due to errors."
+        )
+
+    # ── 2. Write selection sheet to Excel ─────────────────────
+    sheet_name = "qr_selection_w1" if warehouse == 1 else "qr_selection_w2"
+    try:
+        if warehouse == 1:
+            cols = ["QR", "Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+            # values indices:  1       2          3              4           5       6        7          8
+            records = [
+                {c: v for c, v in zip(cols, [values[1], values[2], values[3],
+                                              values[4], values[5], values[6],
+                                              values[7], values[8]])}
+                for values in rows
+            ]
+        else:
+            cols = ["QR", "Set ID", "Hostname", "Equipment Type", "Serial Number",
+                    "Checked By", "Shelf", "Status", "Remarks", "Date"]
+            # values indices: 1     2        3          4                 5
+            #                 6          7       8         9          10
+            records = [
+                {c: v for c, v in zip(cols, [values[1], values[2], values[3], values[4],
+                                              values[5], values[6], values[7], values[8],
+                                              values[9], values[10]])}
+                for values in rows
+            ]
+
+        df_sel = pd.DataFrame(records, columns=cols)
+        df_sel.insert(0, "Generated At",
+                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        # Append / replace the selection sheet without touching other sheets
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(FILE)
+            if sheet_name in wb.sheetnames:
+                del wb[sheet_name]
+            ws = wb.create_sheet(sheet_name)
+            # Write header
+            ws.append(["Generated At"] + cols)
+            for rec in df_sel.itertuples(index=False):
+                ws.append(list(rec))
+            ws.protection.sheet = True
+            ws.protection.enable()
+            wb.save(FILE)
+        except PermissionError:
+            _excel_locked_error()
+
+    except Exception as e:
+        messagebox.showwarning("Stored QR", f"QR codes generated but Excel sheet could not be saved:\n{e}")
+
+    # ── 3. Prompt user for PDF + Excel export ────────────────
+    # ── 3. Prompt user for PDF + Excel export ────────────────
+    def _do_generate_files():
+        # ── Scan existing PDFs for this warehouse ─────────────
+        pdf_folder = QR_LABELS_FOLDER_W1 if warehouse == 1 else QR_LABELS_FOLDER_W2
+        existing_pdfs = []
+        if os.path.exists(pdf_folder):
+            existing_pdfs = sorted(
+                [os.path.splitext(f)[0] for f in os.listdir(pdf_folder) if f.lower().endswith(".pdf")],
+                reverse=True
+            )
+
+        # ── Scan existing Excel files in warehouse-specific export folder ──
+        excel_folder = EXCEL_FOLDER_W1 if warehouse == 1 else EXCEL_FOLDER_W2
+        os.makedirs(excel_folder, exist_ok=True)
+        existing_excels = sorted(
+            [os.path.splitext(f)[0] for f in os.listdir(excel_folder)
+             if f.lower().endswith(".xlsx")],
+            reverse=True
+        )
+
+        # ── Build dialog ───────────────────────────────────────
+        name_win = tk.Toplevel(root)
+        name_win.title("Generate Files — Name Your Export")
+        name_win.resizable(False, False)
+        name_win.transient(root)
+        name_win.grab_set()
+
+        tk.Label(name_win, text="Generate PDF Labels & Excel Export",
+                 font=("Helvetica", 10, "bold"), bg="#6c3483", fg="white",
+                 padx=10, pady=6).pack(fill="x")
+
+        form = tk.Frame(name_win, padx=16, pady=12)
+        form.pack()
+
+        # ── Section header helper ──────────────────────────────
+        def _section(parent, text, row):
+            tk.Label(parent, text=text, font=("Helvetica", 8, "bold"), fg="#6c3483",
+                     anchor="w").grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
+
+        # ── PDF row ────────────────────────────────────────────
+        _section(form, "▸ PDF Label File", 0)
+        tk.Label(form, text="File Name:", anchor="w", width=14).grid(row=1, column=0, sticky="w", pady=3)
+        pdf_name_var = tk.StringVar(value="")
+        pdf_name_cb  = ttk.Combobox(form, textvariable=pdf_name_var, width=28,
+                                     values=existing_pdfs)
+        pdf_name_cb.grid(row=1, column=1, pady=3, padx=(4, 0))
+        tk.Label(form, text=".pdf", fg="gray", font=("Helvetica", 8)).grid(row=1, column=2, sticky="w", padx=(3, 0))
+        tk.Label(form, text="  ↳ Select existing PDF to append pages to, or type a new name",
+                 fg="gray", font=("Helvetica", 7)).grid(row=2, column=1, columnspan=2, sticky="w")
+
+        # ── Excel file row ─────────────────────────────────────
+        _section(form, "▸ Excel File", 3)
+        tk.Label(form, text="File Name:", anchor="w", width=14).grid(row=4, column=0, sticky="w", pady=3)
+        file_name_var = tk.StringVar(value="")
+        file_name_cb  = ttk.Combobox(form, textvariable=file_name_var, width=28,
+                                      values=existing_excels)
+        file_name_cb.grid(row=4, column=1, pady=3, padx=(4, 0))
+        tk.Label(form, text=".xlsx", fg="gray", font=("Helvetica", 8)).grid(row=4, column=2, sticky="w", padx=(3, 0))
+        tk.Label(form, text="  ↳ Select existing Excel to append a sheet to, or type a new name",
+                 fg="gray", font=("Helvetica", 7)).grid(row=5, column=1, columnspan=2, sticky="w")
+
+        # ── Sheet name row — dynamically lists sheets when an existing Excel is chosen ──
+        _section(form, "▸ Excel Sheet", 6)
+        tk.Label(form, text="Sheet Name:", anchor="w", width=14).grid(row=7, column=0, sticky="w", pady=3)
+        sheet_name_var = tk.StringVar(value="")
+        sheet_name_cb  = ttk.Combobox(form, textvariable=sheet_name_var, width=28)
+        sheet_name_cb.grid(row=7, column=1, pady=3, padx=(4, 0))
+        tk.Label(form, text="  ↳ New sheet name to add (existing sheet of same name will be replaced)",
+                 fg="gray", font=("Helvetica", 7)).grid(row=8, column=1, columnspan=2, sticky="w")
+
+        def _refresh_sheet_list(*_):
+            """Populate sheet dropdown whenever the chosen Excel file changes."""
+            chosen = file_name_var.get().strip()
+            if not chosen:
+                sheet_name_cb["values"] = []
+                return
+            safe = chosen if chosen.lower().endswith(".xlsx") else chosen + ".xlsx"
+            xl_peek_folder = EXCEL_FOLDER_W1 if warehouse == 1 else EXCEL_FOLDER_W2
+            path = os.path.join(xl_peek_folder, safe.replace("/", "-").replace("\\", "-"))
+            if os.path.exists(path):
+                try:
+                    from openpyxl import load_workbook
+                    wb_peek = load_workbook(path, data_only=True)
+                    for ws_p in wb_peek.worksheets:
+                        ws_p.protection.sheet = False
+                    sheet_name_cb["values"] = wb_peek.sheetnames
+                    wb_peek.close()
+                    return
+                except Exception:
+                    pass
+            sheet_name_cb["values"] = []
+
+        file_name_cb.bind("<<ComboboxSelected>>", _refresh_sheet_list)
+        file_name_var.trace_add("write", _refresh_sheet_list)
+
+        _wh_label = "Warehouse 1" if warehouse == 1 else "Warehouse 2"
+        tk.Label(form, text=f"(Excel files saved to excel_exports/{_wh_label.lower().replace(' ', '_')}/)",
+                 fg="gray", font=("Helvetica", 8)).grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        error_lbl = tk.Label(form, text="", fg="red", font=("Helvetica", 8))
+        error_lbl.grid(row=10, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        confirmed = [False]
+
+        def on_confirm():
+            pn = pdf_name_var.get().strip()
+            fn = file_name_var.get().strip()
+            sn = sheet_name_var.get().strip()
+            if not pn:
+                error_lbl.config(text="Please enter a PDF file name."); return
+            if not fn:
+                error_lbl.config(text="Please enter an Excel file name."); return
+            if not sn:
+                error_lbl.config(text="Please enter a sheet name."); return
+            confirmed[0] = True
+            name_win.destroy()
+
+        btn_row = tk.Frame(name_win, pady=10)
+        btn_row.pack()
+        tk.Button(btn_row, text="GENERATE", command=on_confirm,
+                  bg="#6c3483", fg="white", width=12).pack(side="left", padx=6)
+        tk.Button(btn_row, text="Cancel", command=name_win.destroy,
+                  width=10).pack(side="left", padx=6)
+
+        name_win.update_idletasks()
+        px, py = root.winfo_rootx(), root.winfo_rooty()
+        pw, ph = root.winfo_width(), root.winfo_height()
+        nw, nh = name_win.winfo_reqwidth(), name_win.winfo_reqheight()
+        name_win.geometry(f"+{px+(pw-nw)//2}+{py+(ph-nh)//2}")
+        name_win.focus_force()
+        root.wait_window(name_win)
+
+        if not confirmed[0]:
+            return
+
+        pdf_name_str   = pdf_name_var.get().strip()
+        file_name_str  = file_name_var.get().strip()
+        sheet_name_str = sheet_name_var.get().strip()
+
+        # ── Check for already-generated items ─────────────────
+        already_in_pdf   = []
+        already_in_excel = []
+
+        # Check PDF sidecar
+        import json
+        pdf_folder  = QR_LABELS_FOLDER_W1 if warehouse == 1 else QR_LABELS_FOLDER_W2
+        safe_pdf    = pdf_name_str.replace(" ", "_").replace("/", "-").replace("\\", "-")
+        if not safe_pdf.lower().endswith(".pdf"):
+            safe_pdf += ".pdf"
+        sidecar_path = os.path.join(pdf_folder, safe_pdf + ".keys.json")
+        if os.path.exists(sidecar_path):
+            try:
+                with open(sidecar_path, "r") as kf:
+                    existing_keys = set(json.load(kf).get("keys", []))
+                for values in rows:
+                    if warehouse == 1:
+                        key = str(values[2])
+                        label = f"  • {values[2]}  (Serial: {values[3]})"
+                    else:
+                        key   = f"{values[2]}-{values[4]}"
+                        label = f"  • {values[2]} — {values[4]}  (Serial: {values[5]})"
+                    if key in existing_keys:
+                        already_in_pdf.append(label)
+            except Exception:
+                pass
+
+        # Check Excel sheet
+        safe_xl = file_name_str.replace("/", "-").replace("\\", "-")
+        if not safe_xl.lower().endswith(".xlsx"):
+            safe_xl += ".xlsx"
+        xl_check_folder = EXCEL_FOLDER_W1 if warehouse == 1 else EXCEL_FOLDER_W2
+        excel_check_path = os.path.join(xl_check_folder, safe_xl)
+        if os.path.exists(excel_check_path):
+            try:
+                from openpyxl import load_workbook
+                wb_chk = load_workbook(excel_check_path, data_only=True)
+                for ws_p in wb_chk.worksheets:
+                    ws_p.protection.sheet = False
+                if sheet_name_str in wb_chk.sheetnames:
+                    ws_chk = wb_chk[sheet_name_str]
+                    existing_xl_keys = set()
+                    for xl_row in ws_chk.iter_rows(min_row=2, values_only=True):
+                        if xl_row and xl_row[1] is not None:
+                            if warehouse == 1:
+                                existing_xl_keys.add((str(xl_row[1]), str(xl_row[2])))
+                            else:
+                                existing_xl_keys.add((str(xl_row[1]), str(xl_row[3]), str(xl_row[4])))
+                    for values in rows:
+                        if warehouse == 1:
+                            key   = (str(values[2]), str(values[3]))
+                            label = f"  • {values[2]}  (Serial: {values[3]})"
+                        else:
+                            key   = (str(values[2]), str(values[4]), str(values[5]))
+                            label = f"  • {values[2]} — {values[4]}  (Serial: {values[5]})"
+                        if key in existing_xl_keys:
+                            already_in_excel.append(label)
+                wb_chk.close()
+            except Exception:
+                pass
+
+        if already_in_pdf or already_in_excel:
+            parts = []
+            if already_in_pdf:
+                parts.append(
+                    f"Already in PDF '{pdf_name_str}'  ({len(already_in_pdf)} item(s)):\n"
+                    + "\n".join(already_in_pdf)
+                )
+            if already_in_excel:
+                parts.append(
+                    f"Already in Excel '{file_name_str}' / sheet '{sheet_name_str}'  ({len(already_in_excel)} item(s)):\n"
+                    + "\n".join(already_in_excel)
+                )
+            msg = (
+                "Some selected items were already generated before:\n\n"
+                + "\n\n".join(parts)
+                + "\n\nDo you want to continue? (duplicates will be skipped)"
+            )
+            if not messagebox.askyesno("Already Generated", msg):
+                return
+
+        # --- Generate PDF ---
+        pdf_msg = ""
+        try:
+            if warehouse == 1:
+                pdf_items = [
+                    {
+                        "Hostname":      str(values[2]),
+                        "Serial Number": str(values[3]),
+                        "Checked By":    str(values[4]),
+                        "Shelf":         str(values[5]),
+                        "Status":        str(values[6]),
+                        "Remarks":       str(values[7]),
+                        "_warehouse":    1,
+                    }
+                    for values in rows
+                ]
+            else:
+                pdf_items = [
+                    {
+                        "Set ID":         str(values[2]),
+                        "Hostname":       str(values[3]),
+                        "Equipment Type": str(values[4]),
+                        "Serial Number":  str(values[5]),
+                        "Checked By":     str(values[6]),
+                        "Shelf":          str(values[7]),
+                        "Status":         str(values[8]),
+                        "Remarks":        str(values[9]),
+                        "_warehouse":     2,
+                    }
+                    for values in rows
+                ]
+            pdf_path = generate_qr_pdf(pdf_items, custom_name=pdf_name_str)
+            pdf_msg = f"PDF saved to:\n{pdf_path}"
+        except Exception as pdf_err:
+            pdf_msg = f"PDF generation failed: {pdf_err}"
+
+        # --- Generate Excel ---
+        excel_msg = ""
+        try:
+            safe_fname = file_name_str.replace("/", "-").replace("\\", "-")
+            if not safe_fname.lower().endswith(".xlsx"):
+                safe_fname += ".xlsx"
+            xl_save_folder = EXCEL_FOLDER_W1 if warehouse == 1 else EXCEL_FOLDER_W2
+            os.makedirs(xl_save_folder, exist_ok=True)
+            excel_path = os.path.join(xl_save_folder, safe_fname)
+
+            if warehouse == 1:
+                cols_xl = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+                records_xl = [
+                    {c: v for c, v in zip(cols_xl,
+                        [values[2], values[3], values[4], values[5], values[6], values[7], values[8]])}
+                    for values in rows
+                ]
+            else:
+                cols_xl = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+                records_xl = [
+                    {c: v for c, v in zip(cols_xl,
+                        [values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10]])}
+                    for values in rows
+                ]
+
+            df_xl = pd.DataFrame(records_xl, columns=cols_xl)
+            df_xl.insert(0, "Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+            import stat
+            if os.path.exists(excel_path):
+                # Temporarily make writable so we can append
+                os.chmod(excel_path, stat.S_IWRITE | stat.S_IREAD)
+                from openpyxl import load_workbook
+                wb_xl = load_workbook(excel_path, data_only=True)
+                # Strip any existing protection so rows can be read
+                for ws_p in wb_xl.worksheets:
+                    ws_p.protection.sheet = False
+                if sheet_name_str in wb_xl.sheetnames:
+                    # Sheet exists — append only rows not already present
+                    ws_xl = wb_xl[sheet_name_str]
+                    existing_xl_keys = set()
+                    for xl_row in ws_xl.iter_rows(min_row=2, values_only=True):
+                        if xl_row and xl_row[1] is not None:
+                            if warehouse == 1:
+                                existing_xl_keys.add((str(xl_row[1]), str(xl_row[2])))
+                            else:
+                                existing_xl_keys.add((str(xl_row[1]), str(xl_row[3]), str(xl_row[4])))
+                    for rec in df_xl.itertuples(index=False):
+                        rec_list = list(rec)
+                        if warehouse == 1:
+                            key = (str(rec_list[1]), str(rec_list[2]))
+                        else:
+                            key = (str(rec_list[1]), str(rec_list[3]), str(rec_list[4]))
+                        if key not in existing_xl_keys:
+                            ws_xl.append(rec_list)
+                else:
+                    # New sheet — create with header
+                    ws_xl = wb_xl.create_sheet(sheet_name_str)
+                    ws_xl.append(["Generated At"] + cols_xl)
+                    for rec in df_xl.itertuples(index=False):
+                        ws_xl.append(list(rec))
+                wb_xl.save(excel_path)
+            else:
+                # Brand new file — no sheet protection on export files
+                with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+                    df_xl.to_excel(writer, sheet_name=sheet_name_str, index=False)
+
+            # Apply OS-level read-only so the file opens in view mode
+            os.chmod(excel_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+            excel_msg = f"Excel saved to:\n{excel_path}"
+            _last_excel_path[warehouse] = excel_path
+        except Exception as xl_err:
+            excel_msg = f"Excel export failed: {xl_err}"
+
+        messagebox.showinfo("Generate Files",
+            f"{count_ok} QR code(s) processed.\n\n{pdf_msg}\n\n{excel_msg}")
+
+    _do_generate_files()
+
+    # ── 4. Open gallery filtered to the generated items ───────
+    _open_qr_gallery(warehouse=warehouse, filter_keys=qr_keys)
+
+def w1_generate_stored_qr(): generate_stored_qr(warehouse=1)
+def w2_generate_stored_qr(): generate_stored_qr(warehouse=2)
+
+def view_excel(warehouse=None):
+    """Open an Excel file manager dialog similar to the QR Label Manager."""
+    manager = tk.Toplevel(root)
+    manager.title(f"Excel File Manager — Warehouse {warehouse}" if warehouse else "Excel File Manager")
+    manager.geometry("700x500")
+    manager.resizable(False, False)
+
+    # ── Header ──────────────────────────────────────────────
+    hdr = tk.Frame(manager, bg="#1e8449")
+    hdr.pack(fill="x")
+    tk.Label(hdr, text="Generated Excel Files", font=("Helvetica", 10, "bold"),
+             bg="#1e8449", fg="white").pack(side="left", padx=10, pady=6)
+    sel_count_lbl = tk.Label(hdr, text="", font=("Helvetica", 9),
+                              bg="#1e8449", fg="#f0b429")
+    sel_count_lbl.pack(side="right", padx=10)
+
+    # ── Checklist canvas area ────────────────────────────────
+    list_frame = tk.Frame(manager, bd=1, relief="sunken")
+    list_frame.pack(fill="both", expand=True, padx=10, pady=(8, 4))
+
+    canvas_cl = tk.Canvas(list_frame, bg="white", highlightthickness=0)
+    sb_cl = ttk.Scrollbar(list_frame, orient="vertical", command=canvas_cl.yview)
+    canvas_cl.configure(yscrollcommand=sb_cl.set)
+    sb_cl.pack(side="right", fill="y")
+    canvas_cl.pack(side="left", fill="both", expand=True)
+    canvas_cl.bind("<MouseWheel>", lambda e: canvas_cl.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+    inner_cl = tk.Frame(canvas_cl, bg="white")
+    cw_id = canvas_cl.create_window((0, 0), window=inner_cl, anchor="nw")
+    canvas_cl.bind("<Configure>", lambda e: canvas_cl.itemconfigure(cw_id, width=e.width))
+
+    row_data   = []   # (iid, full_path, wh_label, filename, date_str, size_str, var)
+    check_vars = {}   # iid -> BooleanVar
+
+    def _refresh_sel_count():
+        n = sum(1 for v in check_vars.values() if v.get())
+        sel_count_lbl.config(text=f"{n} selected" if n else "")
+        clear_btn.config(state="normal" if n else "disabled")
+
+    def _toggle_all():
+        want = not all(v.get() for v in check_vars.values())
+        for v in check_vars.values():
+            v.set(want)
+        _refresh_sel_count()
+        _repaint_rows()
+
+    def _repaint_rows():
+        for iid, _, _, _, _, _, var in row_data:
+            try:
+                fr = inner_cl.nametowidget(f"row_{iid}")
+                fr.config(bg="#e8f5e9" if var.get() else ("white" if row_data.index(
+                    next(r for r in row_data if r[0] == iid)) % 2 == 0 else "#f7f9fc"))
+            except Exception:
+                pass
+
+    EVEN_BG, ODD_BG, SEL_BG = "white", "#f7f9fc", "#e8f5e9"
+
+    def load_excel_files():
+        for w in inner_cl.winfo_children():
+            w.destroy()
+        row_data.clear()
+        check_vars.clear()
+
+        now = datetime.now()
+        all_warehouses = [("Warehouse 1", 1), ("Warehouse 2", 2)]
+        filtered = [(wl, wn) for wl, wn in all_warehouses if warehouse is None or wn == warehouse]
+
+        hdr_row = tk.Frame(inner_cl, bg="#dce3f0")
+        hdr_row.pack(fill="x")
+        tk.Label(hdr_row, text="✔", width=3, bg="#dce3f0", font=("Helvetica", 9, "bold")).pack(side="left", padx=(6,0))
+        for txt, w in [("Warehouse", 110), ("Filename", 240), ("Created", 155), ("Size", 60)]:
+            tk.Label(hdr_row, text=txt, width=w//7, bg="#dce3f0",
+                     font=("Helvetica", 9, "bold"), anchor="w").pack(side="left", padx=4, pady=5)
+
+        idx = 0
+        for warehouse_label, wh_num in filtered:
+            # Scan warehouse-specific Excel export folder only
+            xl_folder = EXCEL_FOLDER_W1 if wh_num == 1 else EXCEL_FOLDER_W2
+            if not os.path.exists(xl_folder):
+                continue
+            files = sorted(
+                [f for f in os.listdir(xl_folder) if f.lower().endswith(".xlsx")],
+                reverse=True
+            )
+            for f in files:
+                full_path = os.path.join(BASE_DIR, f)
+                size_kb = round(os.path.getsize(full_path) / 1024, 1)
+                try:
+                    mtime = os.path.getmtime(full_path)
+                    file_dt = datetime.fromtimestamp(mtime)
+                    delta = now - file_dt
+                    age = "Today" if delta.days == 0 else ("1 day ago" if delta.days == 1 else f"{delta.days} days ago")
+                    date_str = f"{file_dt.strftime('%Y-%m-%d')}  ({age})"
+                except Exception:
+                    date_str = "Unknown"
+
+                iid = f"row{idx}"
+                var = tk.BooleanVar(value=False)
+                check_vars[iid] = var
+                bg = EVEN_BG if idx % 2 == 0 else ODD_BG
+
+                row_fr = tk.Frame(inner_cl, bg=bg, name=f"row_{iid}", cursor="hand2")
+                row_fr.pack(fill="x")
+
+                def _make_toggle(v=var):
+                    def _toggle(e=None):
+                        v.set(not v.get())
+                        _refresh_sel_count()
+                        _repaint_rows()
+                    return _toggle
+
+                cb = tk.Checkbutton(row_fr, variable=var, bg=bg,
+                                    command=lambda: [_refresh_sel_count(), _repaint_rows()])
+                cb.pack(side="left", padx=(6, 0), pady=4)
+                for txt, w in [("All Warehouses", 16), (f, 34), (date_str, 22), (f"{size_kb} kb", 8)]:
+                    lbl = tk.Label(row_fr, text=txt, bg=bg, anchor="w", width=w,
+                                   font=("Helvetica", 9))
+                    lbl.pack(side="left", padx=4, pady=4)
+                    lbl.bind("<Button-1>", _make_toggle(var))
+                row_fr.bind("<Button-1>", _make_toggle(var))
+
+                row_data.append((iid, full_path, warehouse_label, f, date_str, f"{size_kb} kb", var))
+                idx += 1
+            # Only show files once (not duplicated per warehouse label)
+            break
+
+        if idx == 0:
+            tk.Label(inner_cl, text="No generated Excel files found.", fg="gray",
+                     font=("Helvetica", 10), bg="white").pack(pady=30)
+
+        inner_cl.update_idletasks()
+        canvas_cl.configure(scrollregion=canvas_cl.bbox("all"))
+        _refresh_sel_count()
+
+    def open_selected():
+        chosen = [rd for rd in row_data if rd[6].get()]
+        if not chosen:
+            messagebox.showwarning("Warning", "Check a file to open.", parent=manager); return
+        if len(chosen) > 1:
+            messagebox.showerror("Error", "Only 1 file can be opened at a time.\nPlease check only one file.", parent=manager); return
+        full_path = chosen[0][1]
+        if os.path.exists(full_path):
+            os.startfile(full_path)
+        else:
+            messagebox.showerror("Error", "File not found.", parent=manager)
+
+    def clear_selected():
+        chosen = [rd for rd in row_data if rd[6].get()]
+        if not chosen:
+            messagebox.showwarning("Warning", "Check at least one file to delete.", parent=manager); return
+        count = len(chosen)
+        prompt = (f"Delete '{chosen[0][3]}'?" if count == 1
+                  else f"Delete {count} checked file(s)?\nThis cannot be undone.")
+        if not messagebox.askyesno("Confirm Delete", prompt, parent=manager):
+            return
+        failed = []
+        import stat
+        for _, full_path, _, fname, _, _, _ in chosen:
+            try:
+                if os.path.exists(full_path):
+                    os.chmod(full_path, stat.S_IWRITE | stat.S_IREAD)
+                    os.remove(full_path)
+            except Exception as e:
+                failed.append(f"{fname}: {e}")
+        load_excel_files()
+        if failed:
+            messagebox.showerror("Error", "Some files could not be deleted:\n" + "\n".join(failed), parent=manager)
+        else:
+            messagebox.showinfo("Deleted", f"{count} file(s) deleted.", parent=manager)
+
+    # ── Bottom toolbar ───────────────────────────────────────
+    btn_frame_m = tk.Frame(manager)
+    btn_frame_m.pack(pady=8)
+    tk.Button(btn_frame_m, text="☑", command=_toggle_all, width=4).pack(side="left", padx=4)
+    tk.Button(btn_frame_m, text="OPEN", command=open_selected, width=10).pack(side="left", padx=4)
+    clear_btn = tk.Button(btn_frame_m, text="✕ DELETE", command=clear_selected,
+                           width=10, bg="#922b21", fg="white", state="disabled")
+    clear_btn.pack(side="left", padx=4)
+
+    load_excel_files()
+
+def w1_view_excel(): view_excel(warehouse=1)
+def w2_view_excel(): view_excel(warehouse=2)
+
+def view_stored_qr(warehouse=1):
+    """Open the QR gallery filtered to items currently visible in the warehouse table.
+    If no filter is active, shows all existing QR PNG files."""
+    folder = QR_FOLDER_W1 if warehouse == 1 else QR_FOLDER_W2
+    if not os.path.exists(folder):
+        messagebox.showinfo("View QR", "No QR codes folder found.")
+        return
+    files = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
+    if not files:
+        messagebox.showinfo("View QR", "No QR codes have been generated yet.")
+        return
+
+    # Build filter_keys from what is currently visible in the warehouse tree
+    if warehouse == 1:
+        visible_iids = list(tree_warehouse.get_children())
+        if visible_iids:
+            filter_keys = []
+            for iid in visible_iids:
+                values = tree_warehouse.item(iid, "values")
+                # values: ☐(0), QR(1), Hostname(2), ...
+                filter_keys.append(str(values[2]))
+        else:
+            filter_keys = [os.path.splitext(f)[0].replace("_", " ") for f in files]
+    else:
+        visible_iids = list(tree_w2_warehouse.get_children())
+        if visible_iids:
+            filter_keys = []
+            for iid in visible_iids:
+                values = tree_w2_warehouse.item(iid, "values")
+                # values: ☐(0), QR(1), Set ID(2), Hostname(3), Equip Type(4), ...
+                filter_keys.append(f"{values[2]}-{values[4]}")
+        else:
+            filter_keys = [os.path.splitext(f)[0].replace("_", " ") for f in files]
+
+    _open_qr_gallery(warehouse=warehouse, filter_keys=filter_keys)
+
+def w1_view_stored_qr(): view_stored_qr(warehouse=1)
+def w2_view_stored_qr(): view_stored_qr(warehouse=2)
+
+def _w1_refresh_select_all_label():
+    """Update the Select All / Deselect All button label for W1.
+    Safe to call before UI exists — errors are silently swallowed."""
+    try:
+        all_iids = list(tree_warehouse.get_children())
+        checked  = [iid for iid in all_iids if w1_row_checks.get(iid)]
+        w1_select_all_btn.config(
+            text="DESELECT ALL" if all_iids and len(checked) == len(all_iids) else "SELECT ALL")
+    except (NameError, tk.TclError, AttributeError):
+        pass
+
+def _w2_refresh_select_all_label():
+    """Update the Select All / Deselect All button label for W2.
+    Safe to call before UI exists — errors are silently swallowed."""
+    try:
+        all_iids = list(tree_w2_warehouse.get_children())
+        checked  = [iid for iid in all_iids if w2_row_checks.get(iid)]
+        w2_select_all_btn.config(
+            text="DESELECT ALL" if all_iids and len(checked) == len(all_iids) else "SELECT ALL")
+    except (NameError, tk.TclError, AttributeError):
+        pass
+
 
 def show_warehouse():
+    try: w1_back_to_wh_btn.pack_forget()
+    except Exception: pass
+    try: w1_back_to_stage_btn.pack(side="left", padx=(0, 6))
+    except Exception: pass
     w1_update_full_shelves_display()
-    _show_tree(tree_warehouse)
-    tree_warehouse.delete(*tree_warehouse.get_children())
+    try: w1_back_to_wh_btn.pack_forget()
+    except Exception: pass
     df_items = load_items()
     if "Date" not in df_items.columns:
         df_items["Date"] = ""
@@ -947,17 +1886,23 @@ def show_warehouse():
         df_items = _filter_by_date(df_items, date_from, date_to)
     except (NameError, Exception):
         pass  # vars not yet created during startup
-    for _, row in df_items.iterrows():
-        tree_warehouse.insert("", "end", values=tuple(row.get(c, "") for c in ["QR", "Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]))
+    _populate_warehouse_tree(df_items)
 
 def show_available():
+    try: w1_back_to_wh_btn.pack_forget()
+    except Exception: pass
+    try: w1_back_to_stage_btn.pack_forget()
+    except Exception: pass
     _show_tree(tree_available)
+    try: w1_back_to_wh_btn.pack_forget()
+    except Exception: pass
     tree_available.delete(*tree_available.get_children())
     try:
         keyword = search_entry.get().strip().lower()
     except Exception:
         keyword = ""
     df = load_shelves().sort_values("Shelf")
+    df_items = load_items()
     if keyword:
         mask = False
         for col in ["Shelf", "Status", "Date_Full"]:
@@ -966,25 +1911,74 @@ def show_available():
         df = df[mask]
     for _, row in df.iterrows():
         date_full = row.get("Date_Full", "")
-        tree_available.insert("", "end", values=(row["Shelf"], row["Status"], date_full if pd.notna(date_full) else ""))
+        shelf_name = row["Shelf"]
+        item_count = int((df_items["Shelf"] == shelf_name).sum()) if "Shelf" in df_items.columns else 0
+        tree_available.insert("", "end", values=(shelf_name, row["Status"], item_count, date_full if pd.notna(date_full) else ""))
 
 def show_pullouts():
+    try: w1_back_to_stage_btn.pack_forget()
+    except Exception: pass
+    try: w1_back_to_wh_btn.pack(side="left", padx=(0, 6))
+    except Exception: pass
     _show_tree(tree_pullouts)
+    w1_back_to_wh_btn.pack(side="left", padx=(0, 6))
     tree_pullouts.delete(*tree_pullouts.get_children())
     df_po = load_pullouts()
-    for _, row in df_po.iterrows():
-        tree_pullouts.insert("", "end", values=tuple(row.get(c, "") for c in ["Hostname", "Brand/Model", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]))
+    # Re-apply active search/filter state so it survives view switches
     try:
-        all_reasons = sorted(df_po["Pull Reason"].dropna().unique().tolist())
+        keyword        = search_entry.get().strip().lower()
+        shelf_filter   = pull_shelf_var.get()
+        remarks_filter = pull_remarks_var.get()
+        date_from      = w1_date_from_var.get().strip()
+        date_to        = w1_date_to_var.get().strip()
+    except (NameError, Exception):
+        keyword = shelf_filter = remarks_filter = date_from = date_to = ""
+    if keyword:
+        search_cols = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+        mask = False
+        for col in search_cols:
+            if col in df_po.columns:
+                mask = mask | df_po[col].astype(str).str.lower().str.contains(keyword, na=False)
+        df_po = df_po[mask]
+    if shelf_filter:   df_po = df_po[df_po["Shelf"] == shelf_filter]
+    if remarks_filter: df_po = df_po[df_po["Status"] == remarks_filter]
+    df_po = _filter_by_date(df_po, date_from, date_to)
+    w1_pull_row_checks.clear()
+    for _, row in df_po.iterrows():
+        iid = tree_pullouts.insert("", "end", values=(
+            "☐",
+            *tuple(row.get(c, "") for c in ["Hostname", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+        ))
+        w1_pull_row_checks[iid] = False
+    try:
+        all_reasons = sorted(load_pullouts()["Pull Reason"].dropna().unique().tolist())
         pull_reason_filter_entry["values"] = [""] + all_reasons
     except Exception:
         pass
+    active = bool(keyword or shelf_filter or remarks_filter or date_from or date_to)
+    if active:
+        parts = []
+        if keyword:        parts.append(f"Search: \"{keyword}\"")
+        if shelf_filter:   parts.append(f"Shelf: {shelf_filter}")
+        if remarks_filter: parts.append(f"Status: {remarks_filter}")
+        if date_from:      parts.append(f"From: {date_from}")
+        if date_to:        parts.append(f"To: {date_to}")
+        try:
+            w1_search_label.config(text=f"{len(df_po)} result(s) — " + " | ".join(parts), fg="darkorange")
+        except (NameError, Exception):
+            pass
 
 def _populate_warehouse_tree(df):
     _show_tree(tree_warehouse)
     tree_warehouse.delete(*tree_warehouse.get_children())
+    w1_row_checks.clear()
     for _, row in df.iterrows():
-        tree_warehouse.insert("", "end", values=tuple(row.get(c, "") for c in ["QR", "Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]))
+        iid = tree_warehouse.insert("", "end", values=(
+            "☐",
+            *tuple(row.get(c, "") for c in ["QR", "Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"])
+        ))
+        w1_row_checks[iid] = False
+    _w1_refresh_select_all_label()
 
 def search_item():
     keyword        = search_entry.get().strip().lower()
@@ -993,22 +1987,50 @@ def search_item():
     date_from      = w1_date_from_var.get().strip()
     date_to        = w1_date_to_var.get().strip()
 
-    df = load_items()
+    # ── Pull history view is active: filter it instead of warehouse ──
+    if tree_pullouts.winfo_ismapped():
+        df = load_pullouts()
+        if keyword:
+            search_cols = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+            mask = False
+            for col in search_cols:
+                if col in df.columns:
+                    mask = mask | df[col].astype(str).str.lower().str.contains(keyword, na=False)
+            df = df[mask]
+        if shelf_filter:   df = df[df["Shelf"] == shelf_filter]
+        if remarks_filter: df = df[df["Status"] == remarks_filter]
+        df = _filter_by_date(df, date_from, date_to)
+        tree_pullouts.delete(*tree_pullouts.get_children())
+        w1_pull_row_checks.clear()
+        for _, row in df.iterrows():
+            iid = tree_pullouts.insert("", "end", values=(
+                "☐",
+                *tuple(row.get(c, "") for c in ["Hostname", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+            ))
+            w1_pull_row_checks[iid] = False
+        parts = []
+        if keyword:        parts.append(f"Search: \"{keyword}\"")
+        if shelf_filter:   parts.append(f"Shelf: {shelf_filter}")
+        if remarks_filter: parts.append(f"Status: {remarks_filter}")
+        if date_from:      parts.append(f"From: {date_from}")
+        if date_to:        parts.append(f"To: {date_to}")
+        label = f"{len(df)} result(s)" + (" — " + " | ".join(parts) if parts else "")
+        w1_search_label.config(text=label if parts else "", fg="darkorange" if parts else "blue")
+        return
 
+    # ── Default: filter warehouse view ───────────────────────────────
+    df = load_items()
     if keyword:
-        search_cols = ["QR", "Hostname", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+        search_cols = ["QR", "Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
         mask = False
         for col in search_cols:
             if col in df.columns:
                 mask = mask | df[col].astype(str).str.lower().str.contains(keyword, na=False)
         df = df[mask]
-
     if shelf_filter:   df = df[df["Shelf"] == shelf_filter]
     if remarks_filter: df = df[df["Status"] == remarks_filter]
-
     df = _filter_by_date(df, date_from, date_to)
     _populate_warehouse_tree(df)
-
     parts = []
     if keyword:        parts.append(f"Search: \"{keyword}\"")
     if shelf_filter:   parts.append(f"Shelf: {shelf_filter}")
@@ -1029,7 +2051,7 @@ def filter_pull_history():
     tree_pullouts.delete(*tree_pullouts.get_children())
     df = load_pullouts()
     if reason:
-        search_cols = ["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+        search_cols = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
         mask = False
         for col in search_cols:
             if col in df.columns:
@@ -1039,8 +2061,13 @@ def filter_pull_history():
     # Refresh pull reason dropdown
     all_reasons = sorted(load_pullouts()["Pull Reason"].dropna().unique().tolist())
     pull_reason_filter_entry["values"] = [""] + all_reasons
+    w1_pull_row_checks.clear()
     for _, row in df.iterrows():
-        tree_pullouts.insert("", "end", values=tuple(row.get(c, "") for c in ["Hostname", "Brand/Model", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]))
+        iid = tree_pullouts.insert("", "end", values=(
+            "☐",
+            *tuple(row.get(c, "") for c in ["Hostname", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+        ))
+        w1_pull_row_checks[iid] = False
     w1_search_label.config(text=f"Pull History Filtered: {len(df)} result(s)")
 
 def w1_update_full_shelves_display():
@@ -1071,15 +2098,41 @@ def update_all_shelf_dropdowns():
         except NameError:
             pass
 
+def select_pull_item(event):
+    """Toggle checkbox on click in W1 pull history table."""
+    selected = tree_pullouts.selection()
+    if selected:
+        iid = selected[0]
+        if iid in w1_pull_row_checks:
+            w1_pull_row_checks[iid] = not w1_pull_row_checks[iid]
+            tree_pullouts.set(iid, "CP0", "☑" if w1_pull_row_checks[iid] else "☐")
+
+def w2_select_pull_item(event):
+    """Toggle checkbox on click in W2 pull history table."""
+    selected = tree_w2_pullouts.selection()
+    if selected:
+        iid = selected[0]
+        if iid in w2_pull_row_checks:
+            w2_pull_row_checks[iid] = not w2_pull_row_checks[iid]
+            tree_w2_pullouts.set(iid, "CP0", "☑" if w2_pull_row_checks[iid] else "☐")
+
 def select_item(event):
     selected = tree_warehouse.selection()
     if selected:
-        values = tree_warehouse.item(selected[0], "values")
-        # values: QR, Hostname, Brand/Model, Serial Number, Checked By, Shelf, Status, Remarks, Date
+        iid = selected[0]
+        values = tree_warehouse.item(iid, "values")
+        # values: ☐(0), QR(1), Hostname(2), Serial Number(3), Checked By(4), Shelf(5), Status(6), Remarks(7), Date(8)
+
+        # Toggle checkbox on single-click
+        if iid in w1_row_checks:
+            w1_row_checks[iid] = not w1_row_checks[iid]
+            tree_warehouse.set(iid, "C0", "☑" if w1_row_checks[iid] else "☐")
+            _w1_refresh_select_all_label()
+
         pull_item_entry.delete(0, tk.END)
-        pull_item_entry.insert(0, values[1])
+        pull_item_entry.insert(0, values[2])
         w1_status_label.config(
-            text=f"Selected → Hostname: {values[1]}  |  Shelf: {values[5]}  |  Serial: {values[3]}",
+            text=f"Selected → Hostname: {values[2]}  |  Shelf: {values[5]}  |  Serial: {values[3]}",
             fg="#1a5276")
 
 # ========== W1 RESET ==========
@@ -1155,12 +2208,12 @@ def w2_build_set():
     build_win.resizable(False, False)
     build_win.transient(root)
 
-    tk.Label(build_win, text=f"Fill in details for {set_id}", font=("Arial", 10, "bold")).pack(pady=(10, 5))
+    tk.Label(build_win, text=f"Fill in details for {set_id}", font=("Helvetica", 10, "bold")).pack(pady=(10, 5))
 
     shelf_list = sorted(load_shelves_w2()["Shelf"].tolist())
 
-    COL_WIDTHS = [12, 18, 20, 18, 16, 16, 13, 20]
-    HEADERS    = ["Equipment", "Hostname", "Brand / Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks"]
+    COL_WIDTHS = [12, 18, 18, 16, 16, 13, 20]
+    HEADERS    = ["Equipment", "Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks"]
 
     outer = tk.Frame(build_win, padx=10, pady=5)
     outer.pack(fill="both", expand=True)
@@ -1169,7 +2222,7 @@ def w2_build_set():
     hdr_frame = tk.Frame(outer, bg="#dce3f0")
     hdr_frame.pack(fill="x")
     for col, (h, cw) in enumerate(zip(HEADERS, COL_WIDTHS)):
-        tk.Label(hdr_frame, text=h, font=("Arial", 9, "bold"), width=cw, anchor="w",
+        tk.Label(hdr_frame, text=h, font=("Helvetica", 9, "bold"), width=cw, anchor="w",
                  bg="#dce3f0", padx=5).grid(row=0, column=col, padx=5, pady=4, sticky="w")
 
     ROW_COLORS = ("#ffffff", "#f0f4ff")
@@ -1180,21 +2233,20 @@ def w2_build_set():
         row_bg = tk.Frame(outer, bg=bg, bd=1, relief="flat")
         row_bg.pack(fill="x", pady=1)
         tk.Label(row_bg, text=eq_type, width=COL_WIDTHS[0], anchor="w", bg=bg,
-                 font=("Arial", 9, "bold")).grid(row=0, column=0, padx=5, pady=8, sticky="w")
-        hostname_e = tk.Entry(row_bg, width=COL_WIDTHS[1], font=("Arial", 9)); hostname_e.grid(row=0, column=1, padx=5, pady=8)
-        brand_e    = tk.Entry(row_bg, width=COL_WIDTHS[2], font=("Arial", 9)); brand_e.grid(row=0, column=2, padx=5, pady=8)
-        serial_e   = tk.Entry(row_bg, width=COL_WIDTHS[3], font=("Arial", 9)); serial_e.grid(row=0, column=3, padx=5, pady=8)
-        checked_e  = tk.Entry(row_bg, width=COL_WIDTHS[4], font=("Arial", 9)); checked_e.grid(row=0, column=4, padx=5, pady=8)
+                 font=("Helvetica", 9, "bold")).grid(row=0, column=0, padx=5, pady=8, sticky="w")
+        hostname_e = tk.Entry(row_bg, width=COL_WIDTHS[1], font=("Helvetica", 9)); hostname_e.grid(row=0, column=1, padx=5, pady=8)
+        serial_e   = tk.Entry(row_bg, width=COL_WIDTHS[2], font=("Helvetica", 9)); serial_e.grid(row=0, column=2, padx=5, pady=8)
+        checked_e  = tk.Entry(row_bg, width=COL_WIDTHS[3], font=("Helvetica", 9)); checked_e.grid(row=0, column=3, padx=5, pady=8)
         shelf_v = tk.StringVar()
-        ttk.Combobox(row_bg, textvariable=shelf_v, values=shelf_list, width=COL_WIDTHS[5], state="readonly",
-                     font=("Arial", 9)).grid(row=0, column=5, padx=5, pady=8)
+        ttk.Combobox(row_bg, textvariable=shelf_v, values=shelf_list, width=COL_WIDTHS[4], state="readonly",
+                     font=("Helvetica", 9)).grid(row=0, column=4, padx=5, pady=8)
         status_v = tk.StringVar()
-        ttk.Combobox(row_bg, textvariable=status_v, values=["No Issue", "Minimal", "Defective"],
-                     width=COL_WIDTHS[6], state="readonly", font=("Arial", 9)).grid(row=0, column=6, padx=5, pady=8)
-        remarks_e = tk.Entry(row_bg, width=COL_WIDTHS[7], font=("Arial", 9)); remarks_e.grid(row=0, column=7, padx=5, pady=8)
-        rows[eq_type] = (hostname_e, brand_e, serial_e, checked_e, shelf_v, status_v, remarks_e)
+        ttk.Combobox(row_bg, textvariable=status_v, values=STATUS_CHOICES,
+                     width=COL_WIDTHS[5], state="readonly", font=("Helvetica", 9)).grid(row=0, column=5, padx=5, pady=8)
+        remarks_e = tk.Entry(row_bg, width=COL_WIDTHS[6], font=("Helvetica", 9)); remarks_e.grid(row=0, column=6, padx=5, pady=8)
+        rows[eq_type] = (hostname_e, serial_e, checked_e, shelf_v, status_v, remarks_e)
 
-    error_lbl = tk.Label(outer, text="", fg="red", font=("Arial", 8))
+    error_lbl = tk.Label(outer, text="", fg="red", font=("Helvetica", 8))
     error_lbl.pack(pady=(6, 0))
 
     def confirm_set():
@@ -1207,9 +2259,8 @@ def w2_build_set():
                     staged_serials.append(it["Serial Number"])
 
         items = []
-        for eq_type, (hostname_e, brand_e, serial_e, checked_e, shelf_v, status_v, remarks_e) in rows.items():
+        for eq_type, (hostname_e, serial_e, checked_e, shelf_v, status_v, remarks_e) in rows.items():
             hostname   = hostname_e.get().strip()
-            brand      = brand_e.get().strip()
             serial     = serial_e.get().strip()
             checked_by = checked_e.get().strip()
             shelf      = shelf_v.get().strip()
@@ -1218,8 +2269,6 @@ def w2_build_set():
 
             if not hostname:
                 error_lbl.config(text=f"Please enter a Hostname for {eq_type}"); return
-            if not brand:
-                error_lbl.config(text=f"Please enter a Brand/Model for {eq_type}"); return
             if not serial:
                 error_lbl.config(text=f"Please enter a Serial Number for {eq_type}"); return
             if not checked_by:
@@ -1239,7 +2288,6 @@ def w2_build_set():
             items.append({
                 "Equipment Type": eq_type,
                 "Hostname":       hostname,
-                "Brand/Model":    brand,
                 "Serial Number":  serial,
                 "Checked By":     checked_by,
                 "Shelf":          shelf,
@@ -1298,31 +2346,18 @@ def w2_put_warehouse():
     try:
         df_w2 = load_items_w2()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        pdf_items = []
-
         for s in staged_sets:
             set_id = s["set_id"]
             for item in s["items"]:
                 eq_type = item["Equipment Type"]
                 qr_label = f"{set_id}-{eq_type}"
                 qr_code = str(uuid.uuid4())
-                generate_qr(qr_label, (
-                    f"Set ID: {set_id}\n"
-                    f"Hostname: {item.get('Hostname', '')}\n"
-                    f"Equipment: {eq_type}\n"
-                    f"Brand/Model: {item.get('Brand/Model', '')}\n"
-                    f"Serial Number: {item.get('Serial Number', '')}\n"
-                    f"Checked By: {item.get('Checked By', '')}\n"
-                    f"Shelf: {item['Shelf']}\n"
-                    f"Remarks: {item['Remarks']}\n"
-                    f"Date: {now_str}"
-                ), warehouse=2)
+                generate_qr(qr_label, qr_label, warehouse=2)
                 df_w2 = pd.concat([df_w2, pd.DataFrame([{
                     "QR":             qr_code,
                     "Set ID":         set_id,
                     "Hostname":       item.get("Hostname", ""),
                     "Equipment Type": eq_type,
-                    "Brand/Model":    item.get("Brand/Model", ""),
                     "Serial Number":  item.get("Serial Number", ""),
                     "Checked By":     item.get("Checked By", ""),
                     "Shelf":          item["Shelf"],
@@ -1330,27 +2365,9 @@ def w2_put_warehouse():
                     "Remarks":        item.get("Remarks", ""),
                     "Date":           now_str
                 }])], ignore_index=True)
-                pdf_items.append({
-                    "Hostname":       item.get("Hostname", qr_label),
-                    "Set ID":         set_id,
-                    "Equipment Type": eq_type,
-                    "Brand/Model":    item.get("Brand/Model", ""),
-                    "Serial Number":  item.get("Serial Number", ""),
-                    "Checked By":     item.get("Checked By", ""),
-                    "Shelf":          item["Shelf"],
-                    "Status":         item.get("Status", ""),
-                    "Remarks":        item.get("Remarks", ""),
-                    "_warehouse":     2,
-                })
             save_log("PUT WAREHOUSE", f"[W2] Set: {set_id} | Items: {len(s['items'])}")
 
         save_warehouse_2(df_w2, load_shelves_w2())
-
-        try:
-            pdf_path = generate_qr_pdf(pdf_items)
-            pdf_msg = f"\nQR labels saved to:\n{pdf_path}"
-        except Exception as pdf_err:
-            pdf_msg = f"\nPDF generation failed: {pdf_err}"
 
         count = len(staged_sets)
         staged_sets.clear()
@@ -1359,7 +2376,7 @@ def w2_put_warehouse():
         w2_search_label.config(text="", fg="blue")
         w2_status_label.config(text="")
         w2_refresh_all()
-        messagebox.showinfo("Success", f"{count} set(s) added to Warehouse 2{pdf_msg}")
+        messagebox.showinfo("Success", f"{count} set(s) added to Warehouse 2.\nQR codes generated.\nUse 'GENERATE FILES' to create PDF labels and export to Excel.")
 
     except Exception as e:
         messagebox.showerror("Save Error", f"Failed to save:\n{str(e)}")
@@ -1374,9 +2391,13 @@ def _show_w2_tree(tree):
 
 def w2_show_warehouse():
     w2_update_full_shelves_display()
-    _show_w2_tree(tree_w2_warehouse)
-    tree_w2_warehouse.delete(*tree_w2_warehouse.get_children())
+    try: w2_back_to_wh_btn.pack_forget()
+    except Exception: pass
+    try: w2_back_to_stage_btn.pack(side="left", padx=(0, 6))
+    except Exception: pass
     df = load_items_w2()
+    if "Date" not in df.columns:
+        df["Date"] = ""
     # Re-apply any active search/filter so state survives view switches
     try:
         keyword = w2_search_entry.get().strip().lower()
@@ -1388,7 +2409,7 @@ def w2_show_warehouse():
         keyword = shelf_f = type_f = date_from = date_to = ""
     active = bool(keyword or shelf_f or type_f or date_from or date_to)
     if keyword:
-        search_cols = ["QR", "Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+        search_cols = ["QR", "Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
         mask = False
         for col in search_cols:
             if col in df.columns:
@@ -1397,20 +2418,23 @@ def w2_show_warehouse():
     if shelf_f: df = df[df["Shelf"] == shelf_f]
     if type_f:  df = df[df["Equipment Type"] == type_f]
     df = _filter_by_date(df, date_from, date_to)
-    for _, row in df.iterrows():
-        tree_w2_warehouse.insert("", "end", values=tuple(
-            row.get(c, "") for c in ["QR", "Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]))
+    _populate_w2_warehouse_tree(df)
     if active:
         w2_search_label.config(text=f"🔍 Active filter — {len(df)} result(s) shown", fg="darkorange")
 
 def w2_show_available():
     _show_w2_tree(tree_w2_available)
+    try: w2_back_to_wh_btn.pack_forget()
+    except Exception: pass
+    try: w2_back_to_stage_btn.pack_forget()
+    except Exception: pass
     tree_w2_available.delete(*tree_w2_available.get_children())
     try:
         keyword = w2_search_entry.get().strip().lower()
     except Exception:
         keyword = ""
     df = load_shelves_w2().sort_values("Shelf")
+    df_items_w2 = load_items_w2()
     if keyword:
         mask = False
         for col in ["Shelf", "Status", "Date_Full"]:
@@ -1418,28 +2442,73 @@ def w2_show_available():
                 mask = mask | df[col].astype(str).str.lower().str.contains(keyword, na=False)
         df = df[mask]
     for _, row in df.iterrows():
-        date_full = row.get("Date_Full", "")
-        tree_w2_available.insert("", "end", values=(row["Shelf"], row["Status"], date_full if pd.notna(date_full) else ""))
+        date_full  = row.get("Date_Full", "")
+        shelf_name = row["Shelf"]
+        item_count = int((df_items_w2["Shelf"] == shelf_name).sum()) if "Shelf" in df_items_w2.columns else 0
+        tree_w2_available.insert("", "end", values=(shelf_name, row["Status"], item_count, date_full if pd.notna(date_full) else ""))
 
 def w2_show_pullouts():
     _show_w2_tree(tree_w2_pullouts)
+    try: w2_back_to_stage_btn.pack_forget()
+    except Exception: pass
+    w2_back_to_wh_btn.pack(side="left", padx=(0, 6))
     tree_w2_pullouts.delete(*tree_w2_pullouts.get_children())
     df_po2 = load_pullouts_w2()
-    for _, row in df_po2.iterrows():
-        tree_w2_pullouts.insert("", "end", values=tuple(
-            row.get(c, "") for c in ["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]))
+    # Re-apply active search/filter state so it survives view switches
     try:
-        all_reasons = sorted(df_po2["Pull Reason"].dropna().unique().tolist())
+        keyword   = w2_search_entry.get().strip().lower()
+        shelf_f   = w2_pull_shelf_var.get()
+        type_f    = w2_type_filter_var.get()
+        date_from = w2_date_from_var.get().strip()
+        date_to   = w2_date_to_var.get().strip()
+    except (NameError, Exception):
+        keyword = shelf_f = type_f = date_from = date_to = ""
+    if keyword:
+        search_cols = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+        mask = False
+        for col in search_cols:
+            if col in df_po2.columns:
+                mask = mask | df_po2[col].astype(str).str.lower().str.contains(keyword, na=False)
+        df_po2 = df_po2[mask]
+    if shelf_f: df_po2 = df_po2[df_po2["Shelf"] == shelf_f]
+    if type_f:  df_po2 = df_po2[df_po2["Equipment Type"] == type_f]
+    df_po2 = _filter_by_date(df_po2, date_from, date_to)
+    w2_pull_row_checks.clear()
+    for _, row in df_po2.iterrows():
+        iid = tree_w2_pullouts.insert("", "end", values=(
+            "☐",
+            *tuple(row.get(c, "") for c in ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+        ))
+        w2_pull_row_checks[iid] = False
+    try:
+        all_reasons = sorted(load_pullouts_w2()["Pull Reason"].dropna().unique().tolist())
         w2_pull_reason_filter_entry["values"] = [""] + all_reasons
     except Exception:
         pass
+    active = bool(keyword or shelf_f or type_f or date_from or date_to)
+    if active:
+        parts = []
+        if keyword:   parts.append(f"Search: \"{keyword}\"")
+        if shelf_f:   parts.append(f"Shelf: {shelf_f}")
+        if type_f:    parts.append(f"Type: {type_f}")
+        if date_from: parts.append(f"From: {date_from}")
+        if date_to:   parts.append(f"To: {date_to}")
+        try:
+            w2_search_label.config(text=f"{len(df_po2)} result(s) — " + " | ".join(parts), fg="darkorange")
+        except (NameError, Exception):
+            pass
 
 def _populate_w2_warehouse_tree(df):
     _show_w2_tree(tree_w2_warehouse)
     tree_w2_warehouse.delete(*tree_w2_warehouse.get_children())
+    w2_row_checks.clear()
     for _, row in df.iterrows():
-        tree_w2_warehouse.insert("", "end", values=tuple(
-            row.get(c, "") for c in ["QR", "Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]))
+        iid = tree_w2_warehouse.insert("", "end", values=(
+            "☐",
+            *tuple(row.get(c, "") for c in ["QR", "Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"])
+        ))
+        w2_row_checks[iid] = False
+    _w2_refresh_select_all_label()
 
 def w2_search_item():
     keyword   = w2_search_entry.get().strip().lower()
@@ -1448,20 +2517,49 @@ def w2_search_item():
     date_from = w2_date_from_var.get().strip()
     date_to   = w2_date_to_var.get().strip()
 
-    df = load_items_w2()
+    # ── Pull history view is active: filter it instead of warehouse ──
+    if tree_w2_pullouts.winfo_ismapped():
+        df = load_pullouts_w2()
+        if keyword:
+            search_cols = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+            mask = False
+            for col in search_cols:
+                if col in df.columns:
+                    mask = mask | df[col].astype(str).str.lower().str.contains(keyword, na=False)
+            df = df[mask]
+        if shelf_f: df = df[df["Shelf"] == shelf_f]
+        if type_f:  df = df[df["Equipment Type"] == type_f]
+        df = _filter_by_date(df, date_from, date_to)
+        tree_w2_pullouts.delete(*tree_w2_pullouts.get_children())
+        w2_pull_row_checks.clear()
+        for _, row in df.iterrows():
+            iid = tree_w2_pullouts.insert("", "end", values=(
+                "☐",
+                *tuple(row.get(c, "") for c in ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+            ))
+            w2_pull_row_checks[iid] = False
+        parts = []
+        if keyword:   parts.append(f"Search: \"{keyword}\"")
+        if shelf_f:   parts.append(f"Shelf: {shelf_f}")
+        if type_f:    parts.append(f"Type: {type_f}")
+        if date_from: parts.append(f"From: {date_from}")
+        if date_to:   parts.append(f"To: {date_to}")
+        label = (f"{len(df)} result(s)" + (" — " + " | ".join(parts) if parts else "")) if parts else ""
+        w2_search_label.config(text=label, fg="darkorange" if parts else "blue")
+        return
 
+    # ── Default: filter warehouse view ───────────────────────────────
+    df = load_items_w2()
     if keyword:
-        search_cols = ["QR", "Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+        search_cols = ["QR", "Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
         mask = False
         for col in search_cols:
             if col in df.columns:
                 mask = mask | df[col].astype(str).str.lower().str.contains(keyword, na=False)
         df = df[mask]
-
     if shelf_f: df = df[df["Shelf"] == shelf_f]
     if type_f:  df = df[df["Equipment Type"] == type_f]
     df = _filter_by_date(df, date_from, date_to)
-
     _populate_w2_warehouse_tree(df)
     parts = []
     if keyword:   parts.append(f"Search: \"{keyword}\"")
@@ -1502,6 +2600,7 @@ def w2_pull_search_live(event=None):
     if tree_w2_available.winfo_ismapped():
         # Shelf status view is active
         df = load_shelves_w2().sort_values("Shelf")
+        df_items_all = load_items_w2()
         if keyword:
             mask = False
             for col in ["Shelf", "Status", "Date_Full"]:
@@ -1510,31 +2609,46 @@ def w2_pull_search_live(event=None):
             df = df[mask]
         tree_w2_available.delete(*tree_w2_available.get_children())
         for _, row in df.iterrows():
-            date_full = row.get("Date_Full", "")
-            tree_w2_available.insert("", "end", values=(row["Shelf"], row["Status"], date_full if pd.notna(date_full) else ""))
+            date_full  = row.get("Date_Full", "")
+            shelf_name = row["Shelf"]
+            item_count = int((df_items_all["Shelf"] == shelf_name).sum()) if "Shelf" in df_items_all.columns else 0
+            tree_w2_available.insert("", "end", values=(shelf_name, row["Status"], item_count, date_full if pd.notna(date_full) else ""))
         w2_search_label.config(text=f"{len(df)} match(es)" if keyword else "", fg="blue")
 
     elif tree_w2_pullouts.winfo_ismapped():
-        # Pull history view is active
+        # Pull history view is active — respect all active filters
         df = load_pullouts_w2()
+        shelf_f   = w2_pull_shelf_var.get()
+        type_f    = w2_type_filter_var.get()
+        date_from = w2_date_from_var.get().strip()
+        date_to   = w2_date_to_var.get().strip()
         if keyword:
-            search_cols = ["Set ID", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+            search_cols = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
             mask = False
             for col in search_cols:
                 if col in df.columns:
                     mask = mask | df[col].astype(str).str.lower().str.contains(keyword, na=False)
             df = df[mask]
+        if shelf_f: df = df[df["Shelf"] == shelf_f]
+        if type_f:  df = df[df["Equipment Type"] == type_f]
+        df = _filter_by_date(df, date_from, date_to)
         tree_w2_pullouts.delete(*tree_w2_pullouts.get_children())
+        w2_pull_row_checks.clear()
         for _, row in df.iterrows():
-            tree_w2_pullouts.insert("", "end", values=tuple(row.get(c, "") for c in ["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]))
-        w2_search_label.config(text=f"{len(df)} match(es)" if keyword else "", fg="blue")
+            iid = tree_w2_pullouts.insert("", "end", values=(
+                "☐",
+                *tuple(row.get(c, "") for c in ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+            ))
+            w2_pull_row_checks[iid] = False
+        active = bool(keyword or shelf_f or type_f or date_from or date_to)
+        w2_search_label.config(text=f"{len(df)} match(es)" if active else "", fg="darkorange" if active else "blue")
 
     else:
         # Warehouse view (default)
         w2_show_warehouse()
         if keyword:
             df = load_items_w2()
-            search_cols = ["QR", "Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+            search_cols = ["QR", "Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
             mask = False
             for col in search_cols:
                 if col in df.columns:
@@ -1548,58 +2662,75 @@ def w2_pull_search_live(event=None):
 def w2_select_item(event):
     selected = tree_w2_warehouse.selection()
     if selected:
-        values = tree_w2_warehouse.item(selected[0], "values")
-        # values: QR, Set ID, Hostname, Equipment Type, Brand/Model, Serial, Checked By, Shelf, Remarks, Date
+        iid = selected[0]
+        values = tree_w2_warehouse.item(iid, "values")
+        # values: ☐(0), QR(1), Set ID(2), Hostname(3), Equipment Type(4), Serial(5), Checked By(6), Shelf(7), Status(8), Remarks(9), Date(10)
+
+        # Toggle checkbox on single-click
+        if iid in w2_row_checks:
+            w2_row_checks[iid] = not w2_row_checks[iid]
+            tree_w2_warehouse.set(iid, "C0", "☑" if w2_row_checks[iid] else "☐")
+            _w2_refresh_select_all_label()
+
         w2_pull_item_entry.delete(0, tk.END)
-        w2_pull_item_entry.insert(0, f"{values[1]} - {values[3]}")  # SET-001 - Monitor
+        w2_pull_item_entry.insert(0, f"{values[2]} - {values[4]}")  # SET-001 - Monitor
         w2_status_label.config(
-            text=f"Selected → {values[1]} ({values[3]})  |  Hostname: {values[2]}  |  Shelf: {values[7]}  |  Serial: {values[5]}",
+            text=f"Selected → {values[2]} ({values[4]})  |  Hostname: {values[3]}  |  Shelf: {values[7]}  |  Serial: {values[5]}",
             fg="#1a5276")
 
-def w2_unstage_from_warehouse(event):
-    item_id = tree_w2_warehouse.identify_row(event.y)
-    if not item_id:
-        return
-    values = tree_w2_warehouse.item(item_id, "values")
-    if not values:
-        return
-    # values: QR, Set ID, Hostname, Equipment Type, Brand/Model, Serial, Checked By, Shelf, Status, Remarks, Date
-    set_id, hostname, eq_type, brand, serial, checked_by, shelf, status, remarks = values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]
-    if not messagebox.askyesno("Move to Staging",
-        f"Move {eq_type} ({set_id}) back to staging?\n\nShelf: {shelf}"):
+def w2_unstage_from_warehouse(event=None):
+    # Collect checked rows; fall back to treeview selection if nothing checked
+    checked = [iid for iid, state in w2_row_checks.items() if state]
+    if not checked:
+        sel = tree_w2_warehouse.selection()
+        if sel:
+            checked = [sel[0]]
+    if not checked:
+        messagebox.showinfo("Back to Stage", "Check at least one row in the Warehouse table.")
         return
 
-    df_w2 = load_items_w2()
-    match = df_w2[(df_w2["Set ID"] == set_id) & (df_w2["Equipment Type"] == eq_type)]
-    if match.empty:
-        messagebox.showerror("Error", "Item not found in warehouse"); return
+    moved = 0
+    for item_id in checked:
+        values = tree_w2_warehouse.item(item_id, "values")
+        if not values:
+            continue
+        # values: ☐(0), QR(1), Set ID(2), Hostname(3), Equipment Type(4), Serial(5), Checked By(6), Shelf(7), Status(8), Remarks(9), Date(10)
+        set_id, hostname, eq_type, serial, checked_by, shelf, status, remarks = values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]
+        if not messagebox.askyesno("Move to Staging",
+            f"Move {eq_type} ({set_id}) back to staging?\n\nShelf: {shelf}"):
+            continue
 
-    qr_label = f"{set_id}-{eq_type}"
-    delete_qr(qr_label, warehouse=2)
-    df_w2 = df_w2.drop(match.index).reset_index(drop=True)
-    save_warehouse_2(df_w2, load_shelves_w2())
+        df_w2 = load_items_w2()
+        match = df_w2[(df_w2["Set ID"] == set_id) & (df_w2["Equipment Type"] == eq_type)]
+        if match.empty:
+            messagebox.showerror("Error", "Item not found in warehouse")
+            continue
 
-    # Add back as a staged set (single-item set)
-    staged_sets.append({"set_id": set_id, "items": [{
-        "Equipment Type": eq_type,
-        "Hostname":       hostname,
-        "Brand/Model":    brand,
-        "Serial Number":  serial,
-        "Checked By":     checked_by,
-        "Shelf":          shelf,
-        "Status":         status,
-        "Remarks":        remarks,
-    }]})
-    save_log("UNSTAGE", f"[W2] Set: {set_id} | Item: {eq_type} | Shelf: {shelf}")
-    messagebox.showinfo("Moved", f"{eq_type} ({set_id}) moved back to staging")
-    update_w2_staged_display()
-    # Clear the pull search entry and any status text so w2_show_warehouse
-    # doesn't re-apply a stale filter that makes the table appear blank
-    w2_pull_item_entry.delete(0, tk.END)
-    w2_search_label.config(text="", fg="blue")
-    w2_status_label.config(text="")
-    w2_show_warehouse()
-    update_all_shelf_dropdowns()
+        qr_label = f"{set_id}-{eq_type}"
+        delete_qr(qr_label, warehouse=2)
+        df_w2 = df_w2.drop(match.index).reset_index(drop=True)
+        save_warehouse_2(df_w2, load_shelves_w2())
+
+        staged_sets.append({"set_id": set_id, "items": [{
+            "Equipment Type": eq_type,
+            "Hostname":       hostname,
+            "Serial Number":  serial,
+            "Checked By":     checked_by,
+            "Shelf":          shelf,
+            "Status":         status,
+            "Remarks":        remarks,
+        }]})
+        save_log("UNSTAGE", f"[W2] Set: {set_id} | Item: {eq_type} | Shelf: {shelf}")
+        moved += 1
+
+    if moved:
+        messagebox.showinfo("Moved", f"{moved} item(s) moved back to staging.")
+        update_w2_staged_display()
+        w2_pull_item_entry.delete(0, tk.END)
+        w2_search_label.config(text="", fg="blue")
+        w2_status_label.config(text="")
+        w2_show_warehouse()
+        update_all_shelf_dropdowns()
 
 def w2_pull_item():
     selection_text = w2_pull_item_entry.get().strip()
@@ -1635,7 +2766,6 @@ def w2_pull_item():
         "Set ID": set_id,
         "Hostname": str(item_row.get("Hostname", "")),
         "Equipment Type": eq_type,
-        "Brand/Model": str(item_row.get("Brand/Model", "")),
         "Serial Number": str(item_row.get("Serial Number", "")),
         "Checked By": str(item_row.get("Checked By", "")),
         "Shelf": str(item_row.get("Shelf", "")),
@@ -1652,51 +2782,64 @@ def w2_pull_item():
     w2_pull_reason_filter_var.set("")
     w2_refresh_all()
 
-def w2_undo_pull(event):
-    item_id = tree_w2_pullouts.identify_row(event.y)
-    if not item_id:
+def w2_undo_pull(event=None):
+    # Collect checked rows; fall back to treeview selection if nothing checked
+    checked = [iid for iid, state in w2_pull_row_checks.items() if state]
+    if not checked:
+        sel = tree_w2_pullouts.selection()
+        if sel:
+            checked = [sel[0]]
+    if not checked:
+        messagebox.showinfo("Back to Warehouse", "Check at least one row in the Pull History table.")
         return
-    values = tree_w2_pullouts.item(item_id, "values")
-    if not values:
-        return
-    set_id, hostname, eq_type, brand, shelf, status, remarks = values[0], values[1], values[2], values[3], values[4], values[5], values[6]
-    if not messagebox.askyesno("Undo Pull",
-        f"Restore {eq_type} ({set_id}) back to Warehouse 2?\nShelf: {shelf}"):
-        return
 
-    df_w2 = load_items_w2()
-    df_po2 = load_pullouts_w2()
+    restored = 0
+    for item_id in checked:
+        values = tree_w2_pullouts.item(item_id, "values")
+        if not values:
+            continue
+        # values: ☐(0), Set ID(1), Hostname(2), Equip Type(3), Serial(4), Shelf(5), Status(6), Remarks(7), PullReason(8), Date(9)
+        set_id, hostname, eq_type, shelf, status, remarks = values[1], values[2], values[3], values[5], values[6], values[7]
+        if not messagebox.askyesno("Undo Pull",
+            f"Restore {eq_type} ({set_id}) back to Warehouse 2?\nShelf: {shelf}"):
+            continue
 
-    match = df_po2[(df_po2["Set ID"] == set_id) & (df_po2["Equipment Type"] == eq_type)]
-    if match.empty:
-        messagebox.showerror("Error", "Record not found in pull history"); return
+        df_w2 = load_items_w2()
+        df_po2 = load_pullouts_w2()
 
-    pull_row = match.iloc[0]
-    qr_label = f"{set_id}-{eq_type}"
-    qr_code = str(uuid.uuid4())
-    try:
-        generate_qr(qr_label, qr_code, warehouse=2)
-    except Exception as e:
-        messagebox.showwarning("Warning", f"QR not regenerated: {e}")
+        match = df_po2[(df_po2["Set ID"] == set_id) & (df_po2["Equipment Type"] == eq_type)]
+        if match.empty:
+            messagebox.showerror("Error", "Record not found in pull history")
+            continue
 
-    df_w2 = pd.concat([df_w2, pd.DataFrame([{
-        "QR":             qr_code,
-        "Set ID":         set_id,
-        "Hostname":       str(pull_row.get("Hostname", "")),
-        "Equipment Type": eq_type,
-        "Brand/Model":    str(pull_row.get("Brand/Model", "")),
-        "Serial Number":  str(pull_row.get("Serial Number", "")),
-        "Checked By":     str(pull_row.get("Checked By", "")),
-        "Shelf":          shelf,
-        "Status":         status,
-        "Remarks":        remarks,
-        "Date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }])], ignore_index=True)
+        pull_row = match.iloc[0]
+        qr_label = f"{set_id}-{eq_type}"
+        qr_code = str(uuid.uuid4())
+        try:
+            generate_qr(qr_label, qr_code, warehouse=2)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"QR not regenerated: {e}")
 
-    df_po2 = df_po2.drop(match.index).reset_index(drop=True)
-    save_warehouse_2(df_w2, load_shelves_w2(), df_po2)
-    save_log("UNDO PULL", f"[W2] Set: {set_id} | Item: {eq_type} | Shelf: {shelf}")
-    messagebox.showinfo("Restored", f"{eq_type} from {set_id} restored to Warehouse 2")
+        df_w2 = pd.concat([df_w2, pd.DataFrame([{
+            "QR":             qr_code,
+            "Set ID":         set_id,
+            "Hostname":       str(pull_row.get("Hostname", "")),
+            "Equipment Type": eq_type,
+            "Serial Number":  str(pull_row.get("Serial Number", "")),
+            "Checked By":     str(pull_row.get("Checked By", "")),
+            "Shelf":          shelf,
+            "Status":         status,
+            "Remarks":        remarks,
+            "Date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }])], ignore_index=True)
+
+        df_po2 = df_po2.drop(match.index).reset_index(drop=True)
+        save_warehouse_2(df_w2, load_shelves_w2(), df_po2)
+        save_log("UNDO PULL", f"[W2] Set: {set_id} | Item: {eq_type} | Shelf: {shelf}")
+        restored += 1
+
+    if restored:
+        messagebox.showinfo("Restored", f"{restored} item(s) restored to Warehouse 2.")
     w2_show_pullouts()
 
 # ========== W2 ITEM MANAGEMENT ==========
@@ -1721,11 +2864,11 @@ def w2_update_item():
         edit_win.transient(root)
 
         tk.Label(edit_win, text=f"Edit Staged Set: {set_id}",
-                 font=("Arial", 10, "bold"), bg="#27ae60", fg="white",
+                 font=("Helvetica", 10, "bold"), bg="#27ae60", fg="white",
                  padx=10, pady=6).grid(row=0, column=0, columnspan=2, sticky="we")
 
-        COL_WIDTHS = [12, 18, 20, 18, 16, 16, 13, 20]
-        HEADERS    = ["Equipment", "Hostname", "Brand / Model", "Serial Number",
+        COL_WIDTHS = [12, 18, 18, 16, 16, 13, 20]
+        HEADERS    = ["Equipment", "Hostname", "Serial Number",
                       "Checked By", "Shelf", "Status", "Remarks"]
 
         outer = tk.Frame(edit_win, padx=10, pady=5)
@@ -1734,7 +2877,7 @@ def w2_update_item():
         hdr_frame = tk.Frame(outer, bg="#dce3f0")
         hdr_frame.pack(fill="x")
         for col, (h, cw) in enumerate(zip(HEADERS, COL_WIDTHS)):
-            tk.Label(hdr_frame, text=h, font=("Arial", 9, "bold"), width=cw, anchor="w",
+            tk.Label(hdr_frame, text=h, font=("Helvetica", 9, "bold"), width=cw, anchor="w",
                      bg="#dce3f0", padx=5).grid(row=0, column=col, padx=5, pady=4, sticky="w")
 
         ROW_COLORS = ("#ffffff", "#f0f4ff")
@@ -1745,35 +2888,32 @@ def w2_update_item():
             row_bg  = tk.Frame(outer, bg=bg, bd=1, relief="flat")
             row_bg.pack(fill="x", pady=1)
             tk.Label(row_bg, text=eq_type, width=COL_WIDTHS[0], anchor="w",
-                     bg=bg, font=("Arial", 9, "bold")).grid(row=0, column=0, padx=5, pady=8, sticky="w")
-            hostname_e = tk.Entry(row_bg, width=COL_WIDTHS[1], font=("Arial", 9))
+                     bg=bg, font=("Helvetica", 9, "bold")).grid(row=0, column=0, padx=5, pady=8, sticky="w")
+            hostname_e = tk.Entry(row_bg, width=COL_WIDTHS[1], font=("Helvetica", 9))
             hostname_e.insert(0, item.get("Hostname", ""))
             hostname_e.grid(row=0, column=1, padx=5, pady=8)
-            brand_e = tk.Entry(row_bg, width=COL_WIDTHS[2], font=("Arial", 9))
-            brand_e.insert(0, item.get("Brand/Model", ""))
-            brand_e.grid(row=0, column=2, padx=5, pady=8)
-            serial_e = tk.Entry(row_bg, width=COL_WIDTHS[3], font=("Arial", 9))
+            serial_e = tk.Entry(row_bg, width=COL_WIDTHS[2], font=("Helvetica", 9))
             serial_e.insert(0, item.get("Serial Number", ""))
-            serial_e.grid(row=0, column=3, padx=5, pady=8)
-            checked_e = tk.Entry(row_bg, width=COL_WIDTHS[4], font=("Arial", 9))
+            serial_e.grid(row=0, column=2, padx=5, pady=8)
+            checked_e = tk.Entry(row_bg, width=COL_WIDTHS[3], font=("Helvetica", 9))
             checked_e.insert(0, item.get("Checked By", ""))
-            checked_e.grid(row=0, column=4, padx=5, pady=8)
+            checked_e.grid(row=0, column=3, padx=5, pady=8)
             shelf_v = tk.StringVar(value=item.get("Shelf", ""))
             ttk.Combobox(row_bg, textvariable=shelf_v, values=shelf_list,
-                         width=COL_WIDTHS[5], state="readonly",
-                         font=("Arial", 9)).grid(row=0, column=5, padx=5, pady=8)
+                         width=COL_WIDTHS[4], state="readonly",
+                         font=("Helvetica", 9)).grid(row=0, column=4, padx=5, pady=8)
             status_v = tk.StringVar(value=item.get("Status", ""))
             ttk.Combobox(row_bg, textvariable=status_v,
-                         values=["No Issue", "Minimal", "Defective"],
-                         width=COL_WIDTHS[6], state="readonly",
-                         font=("Arial", 9)).grid(row=0, column=6, padx=5, pady=8)
-            remarks_e = tk.Entry(row_bg, width=COL_WIDTHS[7], font=("Arial", 9))
+                         values=STATUS_CHOICES,
+                         width=COL_WIDTHS[5], state="readonly",
+                         font=("Helvetica", 9)).grid(row=0, column=5, padx=5, pady=8)
+            remarks_e = tk.Entry(row_bg, width=COL_WIDTHS[6], font=("Helvetica", 9))
             remarks_e.insert(0, item.get("Remarks", ""))
-            remarks_e.grid(row=0, column=7, padx=5, pady=8)
-            row_widgets[eq_type] = (hostname_e, brand_e, serial_e, checked_e,
+            remarks_e.grid(row=0, column=6, padx=5, pady=8)
+            row_widgets[eq_type] = (hostname_e, serial_e, checked_e,
                                     shelf_v, status_v, remarks_e)
 
-        error_lbl = tk.Label(edit_win, text="", fg="red", font=("Arial", 8))
+        error_lbl = tk.Label(edit_win, text="", fg="red", font=("Helvetica", 8))
         error_lbl.grid(row=2, column=0, columnspan=2, pady=(4, 0))
 
         def save_staged_update():
@@ -1788,17 +2928,15 @@ def w2_update_item():
             ]
             seen_in_dialog = []
             updated_items  = []
-            for eq_type, (hostname_e, brand_e, serial_e, checked_e,
+            for eq_type, (hostname_e, serial_e, checked_e,
                           shelf_v, status_v, remarks_e) in row_widgets.items():
                 hn  = hostname_e.get().strip()
-                br  = brand_e.get().strip()
                 sn  = serial_e.get().strip()
                 cb  = checked_e.get().strip()
                 sh  = shelf_v.get().strip()
                 st  = status_v.get().strip()
                 rm  = remarks_e.get().strip()
                 if not hn:  error_lbl.config(text=f"Hostname required for {eq_type}");       return
-                if not br:  error_lbl.config(text=f"Brand/Model required for {eq_type}");    return
                 if not sn:  error_lbl.config(text=f"Serial Number required for {eq_type}");  return
                 if not cb:  error_lbl.config(text=f"Checked By required for {eq_type}");     return
                 if not sh:  error_lbl.config(text=f"Please select a Shelf for {eq_type}");   return
@@ -1816,9 +2954,8 @@ def w2_update_item():
                 seen_in_dialog.append(sn)
                 updated_items.append({
                     "Equipment Type": eq_type, "Hostname": hn,
-                    "Brand/Model": br, "Serial Number": sn,
-                    "Checked By": cb, "Shelf": sh,
-                    "Status": st,     "Remarks": rm,
+                    "Serial Number": sn, "Checked By": cb,
+                    "Shelf": sh, "Status": st, "Remarks": rm,
                 })
             staged_sets[s_idx]["items"] = updated_items
             edit_win.destroy()
@@ -1920,7 +3057,7 @@ def w2_filter_pull_history():
     tree_w2_pullouts.delete(*tree_w2_pullouts.get_children())
     df = load_pullouts_w2()
     if reason:
-        search_cols = ["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+        search_cols = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
         mask = False
         for col in search_cols:
             if col in df.columns:
@@ -1930,57 +3067,162 @@ def w2_filter_pull_history():
     # Populate the pull reason dropdown with known values from data
     all_reasons = sorted(load_pullouts_w2()["Pull Reason"].dropna().unique().tolist())
     w2_pull_reason_filter_entry["values"] = [""] + all_reasons
+    w2_pull_row_checks.clear()
     for _, row in df.iterrows():
-        tree_w2_pullouts.insert("", "end", values=tuple(
-            row.get(c, "") for c in ["Set ID", "Hostname", "Equipment Type", "Brand/Model", "Shelf", "Status", "Remarks", "Pull Reason", "Date"]))
+        iid = tree_w2_pullouts.insert("", "end", values=(
+            "☐",
+            *tuple(row.get(c, "") for c in ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Shelf", "Status", "Remarks", "Pull Reason", "Date"])
+        ))
+        w2_pull_row_checks[iid] = False
     w2_search_label.config(text=f"Pull History Filtered: {len(df)} result(s)", fg="darkorange")
 
 # ========== QR LABEL PDF ==========
 
-def generate_qr_pdf(items_batch):
+def _lock_pdf(pdf_path):
+    """Restrict PDF to view-only: tries pikepdf encryption first, always falls back to OS read-only."""
+    tmp_lock = pdf_path + ".~lock.pdf"
+    try:
+        import pikepdf
+        permissions = pikepdf.Permissions(
+            accessibility=True,
+            extract=True,
+            modify_annotation=False,
+            modify_assembly=False,
+            modify_form=False,
+            modify_other=False,
+            print_highres=True,
+            print_lowres=True,
+        )
+        with pikepdf.open(pdf_path) as pdf_obj:
+            pdf_obj.save(
+                tmp_lock,
+                encryption=pikepdf.Encryption(
+                    owner="WMS_READONLY_2026",
+                    user="",
+                    R=4,
+                    allow=permissions,
+                )
+            )
+        os.replace(tmp_lock, pdf_path)
+    except ImportError:
+        pass
+    except Exception:
+        try:
+            os.remove(tmp_lock)
+        except Exception:
+            pass
+    # Always apply OS-level read-only regardless of pikepdf outcome
+    try:
+        import stat
+        os.chmod(pdf_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+    except Exception:
+        pass
+
+
+def generate_qr_pdf(items_batch, custom_name=None):
+    import json
     from fpdf import FPDF
     PAGE_W, LABEL_W, COLS = 210, 54, 3
     MARGIN_X, MARGIN_Y, ROW_GAP = 12, 10, 4
     GAP_X = (PAGE_W - (COLS * LABEL_W) - (2 * MARGIN_X)) / (COLS - 1)
-    QR_SIZE, QR_PAD_TOP, QR_PAD_BTM = 20, 3, 3   # mm above/below QR image
-    LINE_H, FIELD_PAD_BTM = 4.8, 2                # line height + bottom padding
+    QR_SIZE, QR_PAD_TOP, QR_PAD_BTM = 20, 3, 3
+    LINE_H, FIELD_PAD_BTM = 4.8, 2
 
+    if not items_batch:
+        return None
+
+    # ── Resolve output path first (needed for sidecar lookup) ──
+    is_w2_batch = items_batch[0].get('_warehouse', 1) == 2
+    if is_w2_batch:
+        output_folder = QR_LABELS_FOLDER_W2
+    else:
+        output_folder = QR_LABELS_FOLDER_W1
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    if custom_name:
+        safe_name = custom_name.replace(" ", "_").replace("/", "-").replace("\\", "-")
+        if safe_name.lower().endswith(".pdf"):
+            safe_name = safe_name[:-4]
+    else:
+        if is_w2_batch:
+            set_ids = list(dict.fromkeys(item.get("Set ID", "") for item in items_batch))
+            label_name = "_".join(set_ids[:3])
+            if len(set_ids) > 3:
+                label_name += f"_and_{len(set_ids)-3}_more"
+        else:
+            existing = [f for f in os.listdir(output_folder) if f.startswith("BATCH_") and f.endswith(".pdf")]
+            batch_nums = []
+            for f in existing:
+                try:
+                    batch_nums.append(int(f.split("_")[1]))
+                except (IndexError, ValueError):
+                    pass
+            label_name = f"BATCH_{max(batch_nums, default=0) + 1}"
+        safe_name = label_name.replace(" ", "_").replace("/", "-")
+
+    pdf_path   = os.path.join(output_folder, f"{safe_name}.pdf")
+    index_path = pdf_path + ".keys.json"
+
+    # ── Load existing sidecar (item data + keys) ──
+    existing_items = []
+    existing_keys  = set()
+    if os.path.exists(index_path) and os.path.exists(pdf_path):
+        try:
+            with open(index_path, "r") as kf:
+                sidecar = json.load(kf)
+            existing_items = sidecar.get("items", [])
+            existing_keys  = set(sidecar.get("keys",  []))
+        except Exception:
+            existing_items = []
+            existing_keys  = set()
+
+    def _item_key(item):
+        if item.get('_warehouse', 1) == 2:
+            return f"{item.get('Set ID', '')}-{item.get('Equipment Type', '')}"
+        return str(item.get('Hostname', ''))
+
+    # Only keep truly new items
+    new_items = [it for it in items_batch if _item_key(it) not in existing_keys]
+    if not new_items:
+        return pdf_path  # nothing to add
+
+    # ── Combine: existing items first, then new ones ──
+    all_items = existing_items + new_items
+
+    # ── Render all items into a fresh PDF so grid is always packed ──
     pdf = FPDF(orientation='P', unit='mm', format='A4')
     pdf.set_auto_page_break(auto=False)
     pdf.add_page()
     col = row = 0
 
-    for item in items_batch:
+    for item in all_items:
         is_w2 = item.get('_warehouse', 1) == 2
 
-        # Build field list
         if is_w2:
             fields = [
-                ("Set ID:",      str(item.get("Set ID", ""))),
-                ("Type:",        str(item.get("Equipment Type", ""))),
-                ("Brand/Model:", str(item.get("Brand/Model", ""))),
-                ("Serial No:",   str(item.get("Serial Number", ""))),
-                ("Shelf:",       str(item.get("Shelf", ""))),
-                ("Status:",      str(item.get("Status", ""))),
-                ("Remarks:",     str(item.get("Remarks", ""))),
-                ("Date:",        datetime.now().strftime("%Y-%m-%d")),
+                ("Set ID:",    str(item.get("Set ID", ""))),
+                ("Type:",      str(item.get("Equipment Type", ""))),
+                ("Serial No:", str(item.get("Serial Number", ""))),
+                ("Shelf:",     str(item.get("Shelf", ""))),
+                ("Status:",    str(item.get("Status", ""))),
+                ("Remarks:",   str(item.get("Remarks", ""))),
+                ("Date:",      str(item.get("_date", datetime.now().strftime("%Y-%m-%d")))),
             ]
             qr_key = f"{item.get('Set ID', '')}-{item.get('Equipment Type', '')}"
-            path = qr_path_for(qr_key, warehouse=2)
+            path   = qr_path_for(qr_key, warehouse=2)
         else:
             fields = [
-                ("Hostname:",    str(item.get("Hostname", ""))),
-                ("Brand/Model:", str(item.get("Brand/Model", ""))),
-                ("Serial No:",   str(item.get("Serial Number", ""))),
-                ("Checked By:",  str(item.get("Checked By", ""))),
-                ("Shelf:",       str(item.get("Shelf", ""))),
-                ("Status:",      str(item.get("Status", ""))),
-                ("Remarks:",     str(item.get("Remarks", ""))),
-                ("Date:",        datetime.now().strftime("%Y-%m-%d")),
+                ("Hostname:",   str(item.get("Hostname", ""))),
+                ("Serial No:",  str(item.get("Serial Number", ""))),
+                ("Checked By:", str(item.get("Checked By", ""))),
+                ("Shelf:",      str(item.get("Shelf", ""))),
+                ("Status:",     str(item.get("Status", ""))),
+                ("Remarks:",    str(item.get("Remarks", ""))),
+                ("Date:",       str(item.get("_date", datetime.now().strftime("%Y-%m-%d")))),
             ]
-            path = qr_path_for(item['Hostname'], warehouse=1)
+            path = qr_path_for(item.get('Hostname', ''), warehouse=1)
 
-        # Compute exact label height: QR block + text block + bottom padding
         LABEL_H = QR_PAD_TOP + QR_SIZE + QR_PAD_BTM + len(fields) * LINE_H + FIELD_PAD_BTM
 
         x = MARGIN_X + col * (LABEL_W + GAP_X)
@@ -1990,15 +3232,12 @@ def generate_qr_pdf(items_batch):
             x = MARGIN_X
             y = MARGIN_Y
 
-        # Draw border tightly around content
         pdf.set_draw_color(150, 150, 150)
         pdf.rect(x, y, LABEL_W, LABEL_H)
 
-        # QR image centred at top of label
         if os.path.exists(path):
             pdf.image(path, x=x + (LABEL_W - QR_SIZE) / 2, y=y + QR_PAD_TOP, w=QR_SIZE, h=QR_SIZE)
 
-        # Text fields
         label_x = x + 2
         value_x = x + 19
         text_y  = y + QR_PAD_TOP + QR_SIZE + QR_PAD_BTM
@@ -2013,31 +3252,27 @@ def generate_qr_pdf(items_batch):
         if col >= COLS:
             col = 0; row += 1
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    if items_batch and items_batch[0].get('_warehouse', 1) == 2:
-        output_folder = QR_LABELS_FOLDER_W2
-        set_ids = list(dict.fromkeys(item.get("Set ID", "") for item in items_batch))
-        label_name = "_".join(set_ids[:3])
-        if len(set_ids) > 3:
-            label_name += f"_and_{len(set_ids)-3}_more"
-    else:
-        output_folder = QR_LABELS_FOLDER_W1
-        os.makedirs(output_folder, exist_ok=True)
-        existing = [f for f in os.listdir(output_folder) if f.startswith("BATCH_") and f.endswith(".pdf")]
-        batch_nums = []
-        for f in existing:
-            try:
-                num = int(f.split("_")[1])
-                batch_nums.append(num)
-            except (IndexError, ValueError):
-                pass
-        next_batch = max(batch_nums, default=0) + 1
-        label_name = f"BATCH_{next_batch}"
-
-    os.makedirs(output_folder, exist_ok=True)
-    safe_name = label_name.replace(" ", "_").replace("/", "-")
-    pdf_path = os.path.join(output_folder, f"{safe_name}_{date_str}.pdf")
     pdf.output(pdf_path)
+
+    # ── Stamp date on new items before saving to sidecar ──
+    today = datetime.now().strftime("%Y-%m-%d")
+    for it in new_items:
+        it.setdefault("_date", today)
+
+    # ── Update sidecar with all item data + keys ──
+    all_keys = list(existing_keys | {_item_key(it) for it in new_items})
+    try:
+        with open(index_path, "w") as kf:
+            json.dump({"keys": all_keys, "items": all_items}, kf)
+    except Exception:
+        pass
+
+    _lock_pdf(pdf_path)
+    try:
+        import stat
+        os.chmod(pdf_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+    except Exception:
+        pass
     return pdf_path
 
 # ========== DIALOGS ==========
@@ -2051,9 +3286,9 @@ def open_label_manager(warehouse=None):
     # ── Header ──────────────────────────────────────────────
     hdr = tk.Frame(manager, bg="#2c3e50")
     hdr.pack(fill="x")
-    tk.Label(hdr, text="QR Label Files", font=("Arial", 10, "bold"),
+    tk.Label(hdr, text="QR Label Files", font=("Helvetica", 10, "bold"),
              bg="#2c3e50", fg="white").pack(side="left", padx=10, pady=6)
-    sel_count_lbl = tk.Label(hdr, text="", font=("Arial", 9),
+    sel_count_lbl = tk.Label(hdr, text="", font=("Helvetica", 9),
                               bg="#2c3e50", fg="#f0b429")
     sel_count_lbl.pack(side="right", padx=10)
 
@@ -2113,10 +3348,10 @@ def open_label_manager(warehouse=None):
         # Column header row
         hdr_row = tk.Frame(inner_cl, bg="#dce3f0")
         hdr_row.pack(fill="x")
-        tk.Label(hdr_row, text="✔", width=3, bg="#dce3f0", font=("Arial", 9, "bold")).pack(side="left", padx=(6,0))
+        tk.Label(hdr_row, text="✔", width=3, bg="#dce3f0", font=("Helvetica", 9, "bold")).pack(side="left", padx=(6,0))
         for txt, w in [("Warehouse", 110), ("Filename", 240), ("Created", 155), ("Size", 60)]:
             tk.Label(hdr_row, text=txt, width=w//7, bg="#dce3f0",
-                     font=("Arial", 9, "bold"), anchor="w").pack(side="left", padx=4, pady=5)
+                     font=("Helvetica", 9, "bold"), anchor="w").pack(side="left", padx=4, pady=5)
 
         idx = 0
         for warehouse_label, folder in filtered:
@@ -2126,8 +3361,8 @@ def open_label_manager(warehouse=None):
                 full_path = os.path.join(folder, f)
                 size_kb = round(os.path.getsize(full_path) / 1024, 1)
                 try:
-                    date_part = f.replace(".pdf", "")[-10:]
-                    file_dt = datetime.strptime(date_part, "%Y-%m-%d")
+                    mtime = os.path.getmtime(full_path)
+                    file_dt = datetime.fromtimestamp(mtime)
                     delta = now - file_dt
                     age = "Today" if delta.days == 0 else ("1 day ago" if delta.days == 1 else f"{delta.days} days ago")
                     date_str = f"{file_dt.strftime('%Y-%m-%d')}  ({age})"
@@ -2154,7 +3389,7 @@ def open_label_manager(warehouse=None):
                 cb.pack(side="left", padx=(6, 0), pady=4)
                 for txt, w in [(warehouse_label, 16), (f, 34), (date_str, 22), (f"{size_kb} kb", 8)]:
                     lbl = tk.Label(row_fr, text=txt, bg=bg, anchor="w", width=w,
-                                   font=("Arial", 9))
+                                   font=("Helvetica", 9))
                     lbl.pack(side="left", padx=4, pady=4)
                     lbl.bind("<Button-1>", _make_toggle(var))
                 row_fr.bind("<Button-1>", _make_toggle(var))
@@ -2164,7 +3399,7 @@ def open_label_manager(warehouse=None):
 
         if idx == 0:
             tk.Label(inner_cl, text="No QR label PDF files found.", fg="gray",
-                     font=("Arial", 10), bg="white").pack(pady=30)
+                     font=("Helvetica", 10), bg="white").pack(pady=30)
 
         inner_cl.update_idletasks()
         canvas_cl.configure(scrollregion=canvas_cl.bbox("all"))
@@ -2192,10 +3427,15 @@ def open_label_manager(warehouse=None):
         if not messagebox.askyesno("Confirm Clear", prompt, parent=manager):
             return
         failed = []
+        import stat
         for _, full_path, _, fname, _, _, _ in chosen:
             try:
                 if os.path.exists(full_path):
+                    os.chmod(full_path, stat.S_IWRITE | stat.S_IREAD)
                     os.remove(full_path)
+                    sidecar = full_path + ".keys.json"
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
             except Exception as e:
                 failed.append(f"{fname}: {e}")
         load_label_files()
@@ -2243,7 +3483,7 @@ def open_activity_log():
     user_scrollbar = ttk.Scrollbar(user_panel, orient="vertical")
     user_scrollbar.pack(side="right", fill="y")
     user_listbox = tk.Listbox(user_panel, width=18, yscrollcommand=user_scrollbar.set,
-                               selectmode="single", exportselection=False, font=("Arial", 9))
+                               selectmode="single", exportselection=False, font=("Helvetica", 9))
     user_listbox.pack(side="left", fill="y")
     user_scrollbar.config(command=user_listbox.yview)
 
@@ -2315,100 +3555,144 @@ def open_activity_log():
 # ========== SWITCH USER ==========
 
 def switch_user():
-    global current_user, session_start
+    global current_user, current_is_admin, session_start
 
-    switch_win = tk.Toplevel(root)
-    switch_win.title("Change User")
-    switch_win.geometry("300x200")
-    switch_win.resizable(False, False)
-    switch_win.transient(root)
+    sw_win = tk.Toplevel(root)
+    sw_win.title("Switch User — Login")
+    sw_win.geometry("320x260")
+    sw_win.resizable(False, False)
+    sw_win.transient(root)
+    sw_win.grab_set()
 
-    tk.Label(switch_win, text="Enter new user name:", font=("Arial", 10)).pack(pady=(20, 5))
-    name_var = tk.StringVar()
-    name_entry = tk.Entry(switch_win, textvariable=name_var, width=25, font=("Arial", 10))
-    name_entry.pack(pady=5)
-    error_label = tk.Label(switch_win, text="", fg="red", font=("Arial", 8))
-    error_label.pack()
+    hdr = tk.Frame(sw_win, bg="#2c3e50")
+    hdr.pack(fill="x")
+    tk.Label(hdr, text="Switch User", font=("Helvetica", 10, "bold"),
+             bg="#2c3e50", fg="white", pady=8).pack()
+    tk.Label(hdr, text="Enter credentials of the account to switch to",
+             font=("Helvetica", 8), bg="#2c3e50", fg="#95a5a6", pady=0).pack(pady=(0, 8))
 
-    def validate_name(name):
-        if not name:
-            return "Please enter a name to continue"
-        if not re.match(r'^[A-Za-z][A-Za-z ]*$', name):
-            return "Name must contain letters and spaces only"
-        if '  ' in name:
-            return "Name cannot contain consecutive spaces"
-        return None
+    form = tk.Frame(sw_win, padx=26, pady=14)
+    form.pack(fill="x")
 
-    def on_key_release(event):
-        val = name_var.get()
-        cleaned = re.sub(r'[^A-Za-z ]', '', val)
-        if cleaned != val:
-            name_var.set(cleaned)
-            name_entry.icursor(len(cleaned))
-            error_label.config(text="Numbers and special characters are not allowed")
-        else:
-            error_label.config(text="")
+    tk.Label(form, text="Username", anchor="w", font=("Helvetica", 9)).grid(row=0, column=0, sticky="w")
+    uv = tk.StringVar()
+    u_entry = tk.Entry(form, textvariable=uv, width=26, font=("Helvetica", 10))
+    u_entry.grid(row=1, column=0, pady=(2, 10), sticky="we")
 
-    def apply_switch():
-        global current_user, session_start
-        new_name = name_var.get().strip()
-        error = validate_name(new_name)
-        if error:
-            error_label.config(text=error); return
+    tk.Label(form, text="Password", anchor="w", font=("Helvetica", 9)).grid(row=2, column=0, sticky="w")
+    pv = tk.StringVar()
+    pw_e = tk.Entry(form, textvariable=pv, width=26, show="●", font=("Helvetica", 10))
+    pw_e.grid(row=3, column=0, pady=(2, 4), sticky="we")
+
+    show_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(form, text="Show password", variable=show_var,
+                   command=lambda: pw_e.config(show="" if show_var.get() else "●"),
+                   font=("Helvetica", 8)).grid(row=4, column=0, sticky="w")
+
+    err = tk.Label(form, text="", fg="#e74c3c", font=("Helvetica", 8), wraplength=260)
+    err.grid(row=5, column=0, sticky="w", pady=(6, 0))
+
+    def do_switch(event=None):
+        global current_user, current_is_admin, session_start
+        uname = uv.get().strip()
+        pw    = pv.get()
+        if not uname or not pw:
+            err.config(text="Please enter both username and password."); return
+        if uname.lower() == current_user.lower():
+            err.config(text="You are already logged in as this user."); return
+        ok, role = authenticate_user(uname, pw)
+        if not ok:
+            err.config(text="Invalid username or password."); return
         save_log("LOGOUT", f"Session ended for '{current_user}'")
-        current_user = new_name
-        session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        user_label.config(text=f"👤  {current_user}")
-        session_label.config(text=f"Session started: {session_start}")
-        save_log("LOGIN", f"Session started by '{current_user}'")
-        switch_win.destroy()
-        messagebox.showinfo("User Changed", f"Successfully switched to: {current_user}")
+        current_user     = uname
+        current_is_admin = (role == "admin")
+        session_start    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _refresh_user_bar()
+        save_log("LOGIN", f"Session started by '{current_user}' (role: {role})")
+        sw_win.destroy()
+        messagebox.showinfo("User Switched", f"Switched to: {current_user}\nRole: {role.capitalize()}")
 
-    name_entry.bind("<KeyRelease>", on_key_release)
-    tk.Button(switch_win, text="Switch", command=apply_switch, width=15).pack(pady=10)
-    switch_win.bind("<Return>", lambda e: apply_switch())
-    switch_win.update_idletasks()
-    switch_win.grab_set()
-    switch_win.focus_force()
-    name_entry.focus_set()
-    switch_win.wait_window()
+    pw_e.bind("<Return>", do_switch)
+    u_entry.bind("<Return>", lambda e: pw_e.focus_set())
+    tk.Button(sw_win, text="SWITCH USER", command=do_switch,
+              bg="#2c3e50", fg="white", font=("Helvetica", 9, "bold"),
+              pady=4, width=18).pack(pady=(0, 10))
+    u_entry.focus_set()
+    sw_win.wait_window()
+
 
 # ========== LOGIN ==========
 
 def show_login():
-    global current_user, session_start
+    global current_user, current_is_admin, session_start
+    initialize_users()
+
     login_win = tk.Tk()
     login_win.title("Warehouse System — Login")
-    login_win.geometry("320x180")
+    login_win.geometry("360x310")
     login_win.resizable(False, False)
     login_win.eval('tk::PlaceWindow . center')
 
-    tk.Label(login_win, text="Warehouse System", font=("Arial", 13, "bold")).pack(pady=(20, 5))
-    tk.Label(login_win, text="Who is using the system?", font=("Arial", 9)).pack()
+    # ── Header ────────────────────────────────────────────────
+    hdr = tk.Frame(login_win, bg="#2c3e50")
+    hdr.pack(fill="x")
+    tk.Label(hdr, text="Warehouse Management System",
+             font=("Helvetica", 12, "bold"), bg="#2c3e50", fg="white",
+             pady=12).pack()
+    tk.Label(hdr, text="Please log in to continue",
+             font=("Helvetica", 9), bg="#2c3e50", fg="#95a5a6",
+             pady=0).pack(pady=(0, 10))
 
-    name_var = tk.StringVar()
-    name_entry = tk.Entry(login_win, textvariable=name_var, width=25, font=("Arial", 10))
-    name_entry.pack(pady=10)
-    name_entry.focus()
+    form = tk.Frame(login_win, padx=30, pady=18)
+    form.pack(fill="x")
 
-    error_label = tk.Label(login_win, text="", fg="red", font=("Arial", 8))
-    error_label.pack()
+    tk.Label(form, text="Username", anchor="w", font=("Helvetica", 9)).grid(row=0, column=0, sticky="w", pady=(0, 2))
+    user_var = tk.StringVar()
+    user_entry = tk.Entry(form, textvariable=user_var, width=26, font=("Helvetica", 10))
+    user_entry.grid(row=1, column=0, pady=(0, 10), sticky="we")
 
-    def attempt_login():
-        global current_user, session_start
-        name = name_var.get().strip()
-        if not name:
-            error_label.config(text="Please enter your name to continue"); return
-        if not re.match(r'^[A-Za-z][A-Za-z ]*$', name):
-            error_label.config(text="Name must contain letters and spaces only"); return
-        if '  ' in name:
-            error_label.config(text="Name cannot contain consecutive spaces"); return
-        current_user = name
-        session_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tk.Label(form, text="Password", anchor="w", font=("Helvetica", 9)).grid(row=2, column=0, sticky="w", pady=(0, 2))
+    pw_var = tk.StringVar()
+    pw_entry = tk.Entry(form, textvariable=pw_var, width=26, show="●", font=("Helvetica", 10))
+    pw_entry.grid(row=3, column=0, pady=(0, 6), sticky="we")
+
+    show_pw_var = tk.BooleanVar(value=False)
+    def _toggle_pw():
+        pw_entry.config(show="" if show_pw_var.get() else "●")
+    tk.Checkbutton(form, text="Show password", variable=show_pw_var,
+                   command=_toggle_pw, font=("Helvetica", 8)).grid(row=4, column=0, sticky="w")
+
+    error_label = tk.Label(form, text="", fg="#e74c3c", font=("Helvetica", 8), wraplength=260)
+    error_label.grid(row=5, column=0, pady=(6, 0), sticky="w")
+
+    def attempt_login(event=None):
+        global current_user, current_is_admin, session_start
+        uname = user_var.get().strip()
+        pw    = pw_var.get()
+        if not uname or not pw:
+            error_label.config(text="Please enter both username and password."); return
+        ok, role = authenticate_user(uname, pw)
+        if not ok:
+            error_label.config(text="Invalid username or password."); return
+        current_user     = uname
+        current_is_admin = (role == "admin")
+        session_start    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         login_win.quit()
 
-    tk.Button(login_win, text="LOGIN", command=attempt_login, width=15).pack(pady=5)
-    name_entry.bind("<Return>", lambda e: attempt_login())
+    btn_row = tk.Frame(login_win, padx=30)
+    btn_row.pack(fill="x")
+    tk.Button(btn_row, text="LOGIN", command=attempt_login,
+              bg="#2c3e50", fg="white", font=("Helvetica", 10, "bold"),
+              width=14, pady=4).pack(side="left", padx=(0, 8))
+
+    def open_register():
+        _show_register_window(login_win)
+
+    tk.Button(btn_row, text="CREATE ACCOUNT", command=open_register,
+              font=("Helvetica", 10), width=17, pady=4).pack(side="left")
+
+    pw_entry.bind("<Return>", attempt_login)
+    user_entry.bind("<Return>", lambda e: pw_entry.focus_set())
 
     def on_close():
         if messagebox.askyesno("Exit", "Exit the Warehouse System?", parent=login_win):
@@ -2416,17 +3700,232 @@ def show_login():
             import sys; sys.exit(0)
 
     login_win.protocol("WM_DELETE_WINDOW", on_close)
+    user_entry.focus_set()
     login_win.mainloop()
     login_win.destroy()
     initialize_log()
-    save_log("LOGIN", f"Session started by '{current_user}'")
+    save_log("LOGIN", f"Session started by '{current_user}' (role: {('admin' if current_is_admin else 'user')})")
+
+
+def _show_register_window(parent):
+    """Registration dialog callable from login screen or admin panel."""
+    reg_win = tk.Toplevel(parent)
+    reg_win.title("Create Account")
+    reg_win.geometry("320x300")
+    reg_win.resizable(False, False)
+    reg_win.transient(parent)
+    reg_win.grab_set()
+
+    hdr = tk.Frame(reg_win, bg="#1a5276")
+    hdr.pack(fill="x")
+    tk.Label(hdr, text="Create New Account", font=("Helvetica", 10, "bold"),
+             bg="#1a5276", fg="white", pady=8).pack()
+
+    form = tk.Frame(reg_win, padx=24, pady=14)
+    form.pack(fill="x")
+
+    tk.Label(form, text="Username", anchor="w", font=("Helvetica", 9)).grid(row=0, column=0, sticky="w")
+    uv = tk.StringVar()
+    tk.Entry(form, textvariable=uv, width=26, font=("Helvetica", 10)).grid(row=1, column=0, pady=(2, 10), sticky="we")
+
+    tk.Label(form, text="Password", anchor="w", font=("Helvetica", 9)).grid(row=2, column=0, sticky="w")
+    pv = tk.StringVar()
+    pw_e = tk.Entry(form, textvariable=pv, width=26, show="●", font=("Helvetica", 10))
+    pw_e.grid(row=3, column=0, pady=(2, 4), sticky="we")
+
+    tk.Label(form, text="Confirm Password", anchor="w", font=("Helvetica", 9)).grid(row=4, column=0, sticky="w")
+    cpv = tk.StringVar()
+    tk.Entry(form, textvariable=cpv, width=26, show="●", font=("Helvetica", 10)).grid(row=5, column=0, pady=(2, 4), sticky="we")
+
+    err = tk.Label(form, text="", fg="#e74c3c", font=("Helvetica", 8), wraplength=260)
+    err.grid(row=6, column=0, sticky="w", pady=(6, 0))
+
+    def do_create():
+        pw   = pv.get()
+        cpw  = cpv.get()
+        if pw != cpw:
+            err.config(text="Passwords do not match."); return
+        msg = create_account(uv.get(), pw)
+        if msg:
+            err.config(text=msg); return
+        role = "Admin" if _is_admin_password(pw) else "User"
+        messagebox.showinfo("Account Created",
+            f"Account '{uv.get()}' created successfully!\nRole: {role}", parent=reg_win)
+        reg_win.destroy()
+
+    tk.Button(reg_win, text="CREATE ACCOUNT", command=do_create,
+              bg="#1a5276", fg="white", font=("Helvetica", 9, "bold"),
+              pady=4).pack(pady=(4, 10))
+    reg_win.focus_force()
+    reg_win.wait_window()
+
+
+
+# ========== ADMIN PANEL ==========
+
+def open_admin_panel():
+    """Account management window — admin only."""
+    if not current_is_admin:
+        messagebox.showerror("Access Denied", "Only admin accounts can access the Account Manager.")
+        return
+
+    panel = tk.Toplevel(root)
+    panel.title("Account Manager")
+    panel.geometry("700x480")
+    panel.resizable(False, False)
+
+    hdr = tk.Frame(panel, bg="#1a5276")
+    hdr.pack(fill="x")
+    tk.Label(hdr, text="Account Manager", font=("Helvetica", 11, "bold"),
+             bg="#1a5276", fg="white", pady=8).pack(side="left", padx=12)
+    tk.Label(hdr, text="(Admin only)", font=("Helvetica", 8, "italic"),
+             bg="#1a5276", fg="#aed6f1").pack(side="left")
+
+    # ── Table ─────────────────────────────────────────────────
+    tbl_frame = tk.Frame(panel, bd=1, relief="sunken")
+    tbl_frame.pack(fill="both", expand=True, padx=10, pady=(8, 4))
+
+    sb_y = ttk.Scrollbar(tbl_frame, orient="vertical")
+    sb_y.pack(side="right", fill="y")
+    tree_acc = ttk.Treeview(tbl_frame,
+        columns=("Username", "Role", "Created"),
+        show="headings",
+        yscrollcommand=sb_y.set)
+    for col, w in [("Username", 200), ("Role", 120), ("Created", 180)]:
+        tree_acc.heading(col, text=col)
+        tree_acc.column(col, width=w, anchor="w")
+    tree_acc.pack(fill="both", expand=True)
+    sb_y.config(command=tree_acc.yview)
+
+    def _load_table():
+        tree_acc.delete(*tree_acc.get_children())
+        df = load_users()
+        for _, row in df.iterrows():
+            role = str(row.get("Role", "user")).capitalize()
+            tree_acc.insert("", "end", values=(
+                row.get("Username", ""),
+                role,
+                row.get("Created", ""),
+            ))
+
+    # ── Bottom action area ────────────────────────────────────
+    act_frame = tk.Frame(panel, padx=10, pady=8)
+    act_frame.pack(fill="x")
+
+    # Create account sub-frame
+    create_lf = tk.LabelFrame(act_frame, text="Create Account", padx=8, pady=6)
+    create_lf.pack(side="left", fill="y", padx=(0, 10))
+
+    tk.Label(create_lf, text="Username", font=("Helvetica", 8)).grid(row=0, column=0, sticky="w")
+    new_user_var = tk.StringVar()
+    tk.Entry(create_lf, textvariable=new_user_var, width=16, font=("Helvetica", 9)).grid(row=1, column=0, pady=(2, 6))
+
+    tk.Label(create_lf, text="Password", font=("Helvetica", 8)).grid(row=2, column=0, sticky="w")
+    new_pw_var = tk.StringVar()
+    tk.Entry(create_lf, textvariable=new_pw_var, width=16, show="●", font=("Helvetica", 9)).grid(row=3, column=0, pady=(2, 4))
+
+    tk.Label(create_lf,
+        text="Include ! @ # → Admin role",
+        font=("Helvetica", 7, "italic"), fg="#7f8c8d").grid(row=4, column=0, sticky="w")
+
+    create_err = tk.Label(create_lf, text="", fg="#e74c3c", font=("Helvetica", 7), wraplength=140)
+    create_err.grid(row=5, column=0, sticky="w")
+
+    def do_create():
+        err = create_account(new_user_var.get(), new_pw_var.get())
+        if err:
+            create_err.config(text=err); return
+        role = "Admin" if _is_admin_password(new_pw_var.get()) else "User"
+        create_err.config(text="")
+        new_user_var.set("")
+        new_pw_var.set("")
+        _load_table()
+        messagebox.showinfo("Created",
+            f"Account '{new_user_var.get() or '(created)'}' added as {role}.", parent=panel)
+
+    tk.Button(create_lf, text="CREATE", command=do_create,
+              bg="#1a5276", fg="white", font=("Helvetica", 8, "bold"), pady=3).grid(row=6, column=0, pady=(6, 0))
+
+    # Delete / change-password sub-frame
+    del_lf = tk.LabelFrame(act_frame, text="Manage Selected Account", padx=8, pady=6)
+    del_lf.pack(side="left", fill="y", padx=(0, 10))
+
+    del_err = tk.Label(del_lf, text="", fg="#e74c3c", font=("Helvetica", 7), wraplength=160)
+    del_err.grid(row=0, column=0, columnspan=2, sticky="w")
+
+    def do_delete():
+        sel = tree_acc.selection()
+        if not sel:
+            del_err.config(text="Select an account first."); return
+        uname = tree_acc.item(sel[0], "values")[0]
+        if uname.lower() == current_user.lower():
+            del_err.config(text="Cannot delete your own account."); return
+        if not messagebox.askyesno("Confirm Delete",
+                f"Delete account '{uname}'?\nThis cannot be undone.", parent=panel):
+            return
+        err = delete_account(uname)
+        if err:
+            del_err.config(text=err); return
+        del_err.config(text="")
+        _load_table()
+        messagebox.showinfo("Deleted", f"Account '{uname}' deleted.", parent=panel)
+
+    tk.Button(del_lf, text="DELETE ACCOUNT", command=do_delete,
+              bg="#922b21", fg="white", font=("Helvetica", 8, "bold"), pady=3,
+              width=16).grid(row=1, column=0, pady=(6, 10), sticky="w")
+
+    tk.Label(del_lf, text="New Password", font=("Helvetica", 8)).grid(row=2, column=0, sticky="w")
+    chpw_var = tk.StringVar()
+    tk.Entry(del_lf, textvariable=chpw_var, width=18, show="●",
+             font=("Helvetica", 9)).grid(row=3, column=0, pady=(2, 4))
+
+    def do_change_pw():
+        sel = tree_acc.selection()
+        if not sel:
+            del_err.config(text="Select an account first."); return
+        uname = tree_acc.item(sel[0], "values")[0]
+        err = change_password(uname, chpw_var.get())
+        if err:
+            del_err.config(text=err); return
+        del_err.config(text="")
+        chpw_var.set("")
+        _load_table()
+        messagebox.showinfo("Updated", f"Password for '{uname}' updated.", parent=panel)
+
+    tk.Button(del_lf, text="CHANGE PASSWORD", command=do_change_pw,
+              bg="#117a65", fg="white", font=("Helvetica", 8, "bold"), pady=3,
+              width=16).grid(row=4, column=0, pady=(4, 0), sticky="w")
+
+    _load_table()
+
+
+def _refresh_user_bar():
+    """Update the user bar label and show/hide admin-only buttons after a user switch."""
+    role_badge = " 🔑" if current_is_admin else ""
+    user_label.config(text=f"👤  {current_user}{role_badge}")
+    session_label.config(text=f"Session started: {session_start}")
+    # Show/hide admin buttons
+    if current_is_admin:
+        activity_log_btn.pack(side="right", padx=4, pady=2)
+        admin_panel_btn.pack(side="right", padx=4, pady=2)
+    else:
+        activity_log_btn.pack_forget()
+        admin_panel_btn.pack_forget()
+
+
+def _guarded_activity_log():
+    if not current_is_admin:
+        messagebox.showerror("Access Denied", "Only admin accounts can view the Activity Log.")
+        return
+    open_activity_log()
+
 
 # ========== UI SETUP ==========
 
 show_login()
 
 root = tk.Tk()
-root.title("Warehouse Management System")
+root.title("Warehouse System — Developed by Mark Benjamin (IT Intern 2026)")
 root.geometry("1280x780")
 root.eval('tk::PlaceWindow . center')
 
@@ -2434,18 +3933,30 @@ root.eval('tk::PlaceWindow . center')
 user_bar = tk.Frame(root, bg="#2c3e50", height=28)
 user_bar.pack(fill="x")
 
-clock_label = tk.Label(user_bar, text="", bg="#2c3e50", fg="#95a5a6", font=("Arial", 8))
+clock_label = tk.Label(user_bar, text="", bg="#2c3e50", fg="#95a5a6", font=("Helvetica", 8))
 clock_label.pack(side="right", padx=10, pady=4)
 
-tk.Button(user_bar, text="Change User", command=switch_user,
-          bg="#34495e", fg="white", bd=0, padx=10).pack(side="right", padx=10, pady=2)
-tk.Button(user_bar, text="📋 Activity Log", command=open_activity_log,
-          bg="#34495e", fg="white", bd=0, padx=10).pack(side="right", padx=4, pady=2)
+tip(tk.Button(user_bar, text="Change User", command=switch_user,
+          bg="#34495e", fg="white", bd=0, padx=10),
+    "Switch to a different user session. Credentials required.").pack(side="right", padx=10, pady=2)
 
-user_label = tk.Label(user_bar, text=f"👤  {current_user}", bg="#2c3e50", fg="white", font=("Arial", 9, "bold"))
+admin_panel_btn = tip(tk.Button(user_bar, text="👥 Accounts", command=open_admin_panel,
+          bg="#34495e", fg="white", bd=0, padx=10),
+    "Manage user accounts (Admin only).")
+activity_log_btn = tip(tk.Button(user_bar, text="📋 Activity Log", command=_guarded_activity_log,
+          bg="#34495e", fg="white", bd=0, padx=10),
+    "View the full history of all actions performed in this system (Admin only).")
+
+# Pack admin buttons only if current user is admin
+if current_is_admin:
+    activity_log_btn.pack(side="right", padx=4, pady=2)
+    admin_panel_btn.pack(side="right", padx=4, pady=2)
+
+role_badge = " 🔑" if current_is_admin else ""
+user_label = tk.Label(user_bar, text=f"👤  {current_user}{role_badge}", bg="#2c3e50", fg="white", font=("Helvetica", 9, "bold"))
 user_label.pack(side="left", padx=10, pady=4)
 
-session_label = tk.Label(user_bar, text=f"Session started: {session_start}", bg="#2c3e50", fg="#95a5a6", font=("Arial", 8))
+session_label = tk.Label(user_bar, text=f"Session started: {session_start}", bg="#2c3e50", fg="#95a5a6", font=("Helvetica", 8))
 session_label.pack(side="left", padx=5, pady=4)
 
 def update_clock():
@@ -2475,80 +3986,99 @@ w1_row1.pack(fill="x")
 # Item Management
 input_frame = tk.LabelFrame(w1_row1, text="Item Management", padx=10, pady=5)
 input_frame.pack(side="left", fill="both", padx=5)
+tip(input_frame, "Add new items to the staging queue before committing to the warehouse.")
 
 tk.Label(input_frame, text="Hostname").grid(row=0, column=0, sticky="w")
 hostname_entry = tk.Entry(input_frame, width=22); hostname_entry.grid(row=0, column=1, pady=3)
-tk.Label(input_frame, text="Brand / Model").grid(row=1, column=0, sticky="w")
-brand_entry = tk.Entry(input_frame, width=22); brand_entry.grid(row=1, column=1, pady=3)
-tk.Label(input_frame, text="Serial Number").grid(row=2, column=0, sticky="w")
-serial_entry = tk.Entry(input_frame, width=22); serial_entry.grid(row=2, column=1, pady=3)
-tk.Label(input_frame, text="Checked By").grid(row=3, column=0, sticky="w")
-checked_by_entry = tk.Entry(input_frame, width=22); checked_by_entry.grid(row=3, column=1, pady=3)
+tip(hostname_entry, "Enter the device hostname (e.g. PC-001). Must be unique.")
 
-tk.Label(input_frame, text="Shelf").grid(row=4, column=0, sticky="w")
+tk.Label(input_frame, text="Serial Number").grid(row=1, column=0, sticky="w")
+serial_entry = tk.Entry(input_frame, width=22); serial_entry.grid(row=1, column=1, pady=3)
+tip(serial_entry, "Enter the manufacturer serial number. Must be unique.")
+
+tk.Label(input_frame, text="Checked By").grid(row=2, column=0, sticky="w")
+checked_by_entry = tk.Entry(input_frame, width=22); checked_by_entry.grid(row=2, column=1, pady=3)
+tip(checked_by_entry, "Name of the person who physically checked this item.")
+
+tk.Label(input_frame, text="Shelf").grid(row=3, column=0, sticky="w")
 shelf_var = tk.StringVar()
 shelf_dropdown = ttk.Combobox(input_frame, textvariable=shelf_var, width=19)
-shelf_dropdown.grid(row=4, column=1, pady=3)
+shelf_dropdown.grid(row=3, column=1, pady=3)
+tip(shelf_dropdown, "Select the shelf/area where this item will be stored.")
 
-tk.Label(input_frame, text="Status").grid(row=5, column=0, sticky="w")
+tk.Label(input_frame, text="Status").grid(row=4, column=0, sticky="w")
 remarks_var = tk.StringVar()
-ttk.Combobox(input_frame, textvariable=remarks_var, values=["No Issue", "Minimal", "Defective"], width=19, state="readonly").grid(row=5, column=1, pady=3)
+ttk.Combobox(input_frame, textvariable=remarks_var, values=STATUS_CHOICES, width=19, state="readonly").grid(row=4, column=1, pady=3)
 
-tk.Label(input_frame, text="Remarks").grid(row=6, column=0, sticky="w")
+tk.Label(input_frame, text="Remarks").grid(row=5, column=0, sticky="w")
 remarks_text_var = tk.StringVar()
-tk.Entry(input_frame, textvariable=remarks_text_var, width=22).grid(row=6, column=1, pady=3)
+remarks_text_entry = tk.Entry(input_frame, textvariable=remarks_text_var, width=22)
+remarks_text_entry.grid(row=5, column=1, pady=3)
+tip(remarks_text_entry, "Optional notes about the item's condition.")
 
 crud_frame = tk.Frame(input_frame)
-crud_frame.grid(row=7, column=0, columnspan=2, pady=5)
-tk.Button(crud_frame, text="PUT",    command=put_item,    width=8).grid(row=0, column=0, padx=3)
-tk.Button(crud_frame, text="UPDATE", command=update_item, width=8).grid(row=0, column=1, padx=3)
-tk.Button(crud_frame, text="↻",      command=reset_ui,    width=3).grid(row=0, column=2, padx=3)
+crud_frame.grid(row=6, column=0, columnspan=2, pady=5)
+tip(tk.Button(crud_frame, text="PUT",    command=put_item,    width=8), "Add this item to the staging queue.").grid(row=0, column=0, padx=3)
+tip(tk.Button(crud_frame, text="UPDATE", command=update_item, width=8), "Update the selected staged item with new values.").grid(row=0, column=1, padx=3)
+tip(tk.Button(crud_frame, text="↻",      command=reset_ui,    width=3), "Clear all input fields and reset the view.").grid(row=0, column=2, padx=3)
 
-tk.Label(input_frame, text="Staged Items (Click to Edit)", fg="green", font=("Arial", 9, "bold")).grid(row=8, column=0, columnspan=2, sticky="w")
+tk.Label(input_frame, text="Staged Items (Click to Edit)", fg="green", font=("Helvetica", 9, "bold")).grid(row=7, column=0, columnspan=2, sticky="w")
 staged_listbox = tk.Listbox(input_frame, height=4, width=32)
-staged_listbox.grid(row=9, column=0, columnspan=2, sticky="we", pady=3)
+staged_listbox.grid(row=8, column=0, columnspan=2, sticky="we", pady=3)
 staged_listbox.bind("<<ListboxSelect>>", select_staged_item)
+tip(staged_listbox, "Items waiting to be committed. Click a row to load it back into the fields for editing.")
 
 staging_btn_frame = tk.Frame(input_frame)
-staging_btn_frame.grid(row=10, column=0, columnspan=2, pady=3)
-tk.Button(staging_btn_frame, text="CLEAR ITEMS",   command=remove_from_staging, width=13).pack(side="left", padx=2)
-tk.Button(staging_btn_frame, text="PUT WAREHOUSE", command=put_warehouse,       width=13).pack(side="left", padx=2)
+staging_btn_frame.grid(row=9, column=0, columnspan=2, pady=3)
+tip(tk.Button(staging_btn_frame, text="CLEAR ITEMS",   command=remove_from_staging, width=13),
+    "Remove the selected staged item (or all if none selected).").pack(side="left", padx=2)
+tip(tk.Button(staging_btn_frame, text="PUT WAREHOUSE", command=put_warehouse,       width=13),
+    "Commit all staged items to Warehouse 1 and generate QR codes. Use GENERATE FILES to create PDF labels.").pack(side="left", padx=2)
 
 # Shelf Controls W1
 shelf_mid_frame = tk.Frame(w1_row1)
 shelf_mid_frame.pack(side="left", fill="both", expand=True, padx=5)
 shelf_control_frame = tk.LabelFrame(shelf_mid_frame, text="Shelf Control & Management", padx=10, pady=5)
 shelf_control_frame.pack(fill="x")
+tip(shelf_control_frame, "Manage shelf availability and add/remove shelves for Warehouse 1.")
 
 status_control_frame = tk.LabelFrame(shelf_control_frame, text="Status Control", padx=8, pady=5)
 status_control_frame.pack(fill="x", pady=(0, 5))
+tip(status_control_frame, "Mark a shelf as FULL (no more items) or AVAILABLE.")
 shelf_control_var = tk.StringVar()
 shelf_control_dropdown = ttk.Combobox(status_control_frame, textvariable=shelf_control_var, width=22, state="readonly")
 shelf_control_dropdown.pack(side="left", padx=5)
-tk.Button(status_control_frame, text="SET FULL",      command=lambda: set_shelf_status("FULL"),      width=10).pack(side="left", padx=3)
-tk.Button(status_control_frame, text="SET AVAILABLE", command=lambda: set_shelf_status("AVAILABLE"), width=12).pack(side="left", padx=3)
-tk.Button(status_control_frame, text="↻",             command=reset_shelf_control,                   width=3).pack(side="left", padx=3)
+tip(shelf_control_dropdown, "Select the shelf whose status you want to change.")
+tip(tk.Button(status_control_frame, text="SET FULL",      command=lambda: set_shelf_status("FULL"),      width=10),
+    "Mark selected shelf as FULL — prevents new items from being placed there.").pack(side="left", padx=3)
+tip(tk.Button(status_control_frame, text="SET AVAILABLE", command=lambda: set_shelf_status("AVAILABLE"), width=12),
+    "Mark selected shelf as AVAILABLE — allows new items to be placed.").pack(side="left", padx=3)
+tip(tk.Button(status_control_frame, text="↻",             command=reset_shelf_control,                   width=3),
+    "Clear the shelf selection.").pack(side="left", padx=3)
 
 add_remove_frame = tk.LabelFrame(shelf_control_frame, text="Add / Remove", padx=8, pady=5)
 add_remove_frame.pack(fill="x")
+tip(add_remove_frame, "Add a new shelf by typing its name, or remove an existing empty shelf.")
 remove_shelf_var = tk.StringVar()
 remove_shelf_dropdown = ttk.Combobox(add_remove_frame, textvariable=remove_shelf_var, width=22)
 remove_shelf_dropdown.pack(side="left", padx=5)
-tk.Button(add_remove_frame, text="ADD",    command=add_shelf,           ).pack(side="left", padx=3)
-tk.Button(add_remove_frame, text="REMOVE", command=remove_shelf,         ).pack(side="left", padx=3)
-tk.Button(add_remove_frame, text="↻",      command=reset_shelf_addition, width=3).pack(side="left", padx=3)
+tip(remove_shelf_dropdown, "Type a new shelf name to add, or select an existing one to remove.")
+tip(tk.Button(add_remove_frame, text="ADD",    command=add_shelf   ), "Add the typed shelf name as a new shelf.").pack(side="left", padx=3)
+tip(tk.Button(add_remove_frame, text="REMOVE", command=remove_shelf ), "Remove the selected shelf (only if it has no items).").pack(side="left", padx=3)
+tip(tk.Button(add_remove_frame, text="↻",      command=reset_shelf_addition, width=3), "Clear the shelf name field.").pack(side="left", padx=3)
 
 # View W1
 view_frame = tk.LabelFrame(w1_row1, text="View", padx=10, pady=5)
 view_frame.pack(side="right", fill="both", padx=5)
-for text, cmd in [
-    ("SHOW WAREHOUSE", show_warehouse),
-    ("SHELF STATUS",   show_available),
-    ("PULL HISTORY",   show_pullouts),
-    ("STORED QR",      show_qr_codes),
-    ("QR LABELS",      lambda: open_label_manager(warehouse=1)),
+tip(view_frame, "Switch between different table views for Warehouse 1.")
+for text, cmd, tooltip in [
+    ("SHOW WAREHOUSE", show_warehouse,  "View all items currently stored in Warehouse 1."),
+    ("SHELF STATUS",   show_available,  "View each shelf's status and how many items it holds."),
+    ("PULL HISTORY",   show_pullouts,   "View items that have been pulled out of Warehouse 1."),
+    ("QR LABELS",      lambda: open_label_manager(warehouse=1), "Open and manage printable QR label PDF files."),
+    ("VIEW EXCEL",     w1_view_excel,   "Open the last Excel file generated by GENERATE FILES for Warehouse 1."),
 ]:
-    tk.Button(view_frame, text=text, command=cmd, width=15).pack(anchor="w", pady=3)
+    tip(tk.Button(view_frame, text=text, command=cmd, width=15), tooltip).pack(anchor="w", pady=3)
 
 # Search & Filter W1
 w1_pullout_frame = tk.LabelFrame(w1_main, text="Warehouse 1", padx=10, pady=8)
@@ -2572,10 +4102,10 @@ pull_shelf_dropdown.pack(side="left", padx=(0, 8))
 
 tk.Label(w1_sf_row1, text="Remarks:").pack(side="left", padx=(5, 2))
 pull_remarks_var = tk.StringVar()
-ttk.Combobox(w1_sf_row1, textvariable=pull_remarks_var, values=["No Issue", "Minimal", "Defective"], width=14, state="readonly").pack(side="left", padx=(0, 8))
+ttk.Combobox(w1_sf_row1, textvariable=pull_remarks_var, values=[""] + STATUS_CHOICES, width=14, state="readonly").pack(side="left", padx=(0, 8))
 
-tk.Button(w1_sf_row1, text="🔍", command=search_item,       width=3).pack(side="left", padx=3)
-tk.Button(w1_sf_row1, text="↻",  command=clear_pull_filters, width=3).pack(side="left", padx=3)
+tip(tk.Button(w1_sf_row1, text="🔍", command=search_item,       width=3), "Search and filter the warehouse table.").pack(side="left", padx=3)
+tip(tk.Button(w1_sf_row1, text="↻",  command=clear_pull_filters, width=3), "Clear all search and filter fields.").pack(side="left", padx=3)
 
 # Row 2: date range (calendar pickers)
 w1_sf_row2 = tk.Frame(w1_search_filter)
@@ -2600,8 +4130,8 @@ pull_reason_filter_entry = ttk.Combobox(w1_po_row1, textvariable=pull_reason_fil
 pull_reason_filter_entry.pack(side="left", padx=(0, 8))
 w1_pull_date_from_var = tk.StringVar()
 w1_pull_date_to_var   = tk.StringVar()
-tk.Button(w1_po_row1, text="↻",  command=reset_pull_out,      width=3).pack(side="left", padx=2)
-tk.Button(w1_po_row1, text="WAREHOUSE PULL", command=pull_item, width=16).pack(side="left", padx=(10, 3))
+tip(tk.Button(w1_po_row1, text="↻",  command=reset_pull_out,      width=3),  "Clear pull-out fields and reset the view.").pack(side="left", padx=2)
+tip(tk.Button(w1_po_row1, text="WAREHOUSE PULL", command=pull_item, width=16), "Pull the selected item out of Warehouse 1. A pull reason is required.").pack(side="left", padx=(10, 3))
 
 # Status bar W1
 w1_status_bar = tk.Frame(w1_main)
@@ -2610,27 +4140,69 @@ w1_full_label   = tk.Label(w1_status_bar, text="FULL Shelves: None", fg="red"); 
 w1_search_label = tk.Label(w1_status_bar, text="", fg="blue");                   w1_search_label.pack(side="left", padx=10)
 w1_status_label = tk.Label(w1_status_bar, text="", fg="green");                  w1_status_label.pack(side="left", padx=10)
 
+# ── W1 Table toolbar (Select All + Stored QR) ──────────────
+w1_table_toolbar = tk.Frame(w1_main)
+w1_table_toolbar.pack(fill="x", padx=5, pady=(2, 0))
+
+def w1_toggle_select_all():
+    all_iids = list(tree_warehouse.get_children())
+    checked  = [iid for iid in all_iids if w1_row_checks.get(iid)]
+    # If pull history is visible, toggle that instead
+    if tree_pullouts.winfo_ismapped():
+        all_iids = list(tree_pullouts.get_children())
+        checked  = [iid for iid in all_iids if w1_pull_row_checks.get(iid)]
+        new_state = len(checked) < len(all_iids)
+        for iid in all_iids:
+            w1_pull_row_checks[iid] = new_state
+            tree_pullouts.set(iid, "CP0", "☑" if new_state else "☐")
+        return
+    new_state = len(checked) < len(all_iids)
+    for iid in all_iids:
+        w1_row_checks[iid] = new_state
+        tree_warehouse.set(iid, "C0", "☑" if new_state else "☐")
+    _w1_refresh_select_all_label()
+
+w1_select_all_btn = tk.Button(w1_table_toolbar, text="SELECT ALL",
+    command=w1_toggle_select_all, width=12)
+w1_select_all_btn.pack(side="left", padx=(0, 6))
+tip(w1_select_all_btn, "Select or deselect all visible rows in the active table.")
+tip(tk.Button(w1_table_toolbar, text="GENERATE FILES", command=w1_generate_stored_qr,
+          bg="#6c3483", fg="white", width=15),
+    "Generate QR PNGs, PDF labels and Excel export for selected items.").pack(side="left", padx=(0, 6))
+tip(tk.Button(w1_table_toolbar, text="VIEW QR", command=w1_view_stored_qr,
+          bg="#1a5276", fg="white", width=10),
+    "View all existing QR codes without regenerating.").pack(side="left", padx=(0, 6))
+w1_back_to_stage_btn = tip(tk.Button(w1_table_toolbar, text="BACK TO STAGE", command=unstage_from_warehouse,
+          bg="#117a65", fg="white", width=15),
+    "Move checked warehouse items back to the Item Management staging list.")
+w1_back_to_stage_btn.pack(side="left", padx=(0, 6))
+w1_back_to_wh_btn = tip(tk.Button(w1_table_toolbar, text="BACK TO WAREHOUSE", command=undo_pull,
+          bg="#922b21", fg="white", width=18),
+    "Restore checked pull history items back to Warehouse 1.")
+# Hidden by default; shown only when Pull History view is active
+
 # Tables W1
 w1_table_frame = tk.Frame(w1_main)
 w1_table_frame.pack(fill="both", expand=True, pady=5)
 
-tree_warehouse = ttk.Treeview(w1_table_frame, columns=("C1","C2","C3","C4","C5","C6","C7","C8","C9"), show='headings')
-for col, text, width in zip(("C1","C2","C3","C4","C5","C6","C7","C8","C9"),
-    ("QR","Hostname","Brand/Model","Serial Number","Checked By","Shelf","Status","Remarks","Date"),
-    (180,130,120,110,105,120,90,130,140)):
+tree_warehouse = ttk.Treeview(w1_table_frame, columns=("C0","C1","C2","C3","C4","C5","C6","C7","C8"), show='headings')
+for col, text, width in zip(("C0","C1","C2","C3","C4","C5","C6","C7","C8"),
+    ("✔","QR","Hostname","Serial Number","Checked By","Shelf","Status","Remarks","Date"),
+    (30,180,150,120,115,130,95,145,145)):
     tree_warehouse.heading(col, text=text); tree_warehouse.column(col, width=width)
+tree_warehouse.column("C0", anchor="center", stretch=False)
 tree_warehouse.bind("<<TreeviewSelect>>", select_item)
-tree_warehouse.bind("<Double-1>", unstage_from_warehouse)
 
-tree_available = ttk.Treeview(w1_table_frame, columns=("C1","C2","C3"), show='headings')
-for col, text, width in zip(("C1","C2","C3"), ("Shelf","Status","Date_Full"), (250,150,200)):
+tree_available = ttk.Treeview(w1_table_frame, columns=("C1","C2","C3","C4"), show='headings')
+for col, text, width in zip(("C1","C2","C3","C4"), ("Shelf","Status","Items Stored","Date Set Full"), (250,140,110,200)):
     tree_available.heading(col, text=text); tree_available.column(col, width=width)
 
-tree_pullouts = ttk.Treeview(w1_table_frame, columns=("C1","C2","C3","C4","C5","C6","C7"), show='headings')
-for col, text, width in zip(("C1","C2","C3","C4","C5","C6","C7"),
-    ("Hostname","Brand/Model","Shelf","Status","Remarks","Pull Reason","Date"), (140,120,120,90,150,200,150)):
+tree_pullouts = ttk.Treeview(w1_table_frame, columns=("CP0","C1","C2","C3","C4","C5","C6","C7"), show='headings')
+for col, text, width in zip(("CP0","C1","C2","C3","C4","C5","C6","C7"),
+    ("✔","Hostname","Serial Number","Shelf","Status","Remarks","Pull Reason","Date"), (30,145,125,125,90,155,205,150)):
     tree_pullouts.heading(col, text=text); tree_pullouts.column(col, width=width)
-tree_pullouts.bind("<Double-1>", undo_pull)
+tree_pullouts.column("CP0", anchor="center", stretch=False)
+tree_pullouts.bind("<<TreeviewSelect>>", select_pull_item)
 
 tree_qr = ttk.Treeview(w1_table_frame, columns=("C1","C2","C3"), show='headings')
 for col, text, width in zip(("C1","C2","C3"),
@@ -2650,8 +4222,10 @@ w2_row1.pack(fill="x")
 # Equipment selection + staging panel
 w2_input_frame = tk.LabelFrame(w2_row1, text="Set Staging", padx=10, pady=5)
 w2_input_frame.pack(side="left", fill="both", padx=5)
+tip(w2_input_frame, "Build equipment sets (Monitor, Keyboard, Mouse, Headset) and stage them before committing to Warehouse 2.")
 
-tk.Label(w2_input_frame, text="Select Equipment:", font=("Arial", 9, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+tip(tk.Label(w2_input_frame, text="Select Equipment:", font=("Helvetica", 9, "bold")),
+    "Check the equipment types to include in this set.").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
 w2_equip_vars = {}
 for i, eq in enumerate(EQUIPMENT_TYPES):
@@ -2660,64 +4234,80 @@ for i, eq in enumerate(EQUIPMENT_TYPES):
     tk.Checkbutton(w2_input_frame, text=eq, variable=var, width=10, anchor="w").grid(
         row=1 + i // 2, column=i % 2, sticky="w", padx=4)
 
-tk.Button(w2_input_frame, text="BUILD SET", command=w2_build_set,
-          bg="#2980b9", fg="white", width=28).grid(row=3, column=0, columnspan=2, pady=(8, 4))
+tip(tk.Button(w2_input_frame, text="BUILD SET", command=w2_build_set,
+          bg="#2980b9", fg="white", width=28),
+    "Open a form to enter details for each selected equipment type, then stage the set.").grid(row=3, column=0, columnspan=2, pady=(8, 4))
 
-tk.Label(w2_input_frame, text="Staged Sets", fg="green", font=("Arial", 9, "bold")).grid(row=4, column=0, columnspan=2, sticky="w")
+tip(tk.Label(w2_input_frame, text="Staged Sets", fg="green", font=("Helvetica", 9, "bold")),
+    "Sets waiting to be committed to Warehouse 2.").grid(row=4, column=0, columnspan=2, sticky="w")
 w2_staged_listbox = tk.Listbox(w2_input_frame, height=5, width=34)
 w2_staged_listbox.grid(row=5, column=0, columnspan=2, sticky="we", pady=3)
+tip(w2_staged_listbox, "Click a set to select it for editing. ⚠ means a required equipment type is missing.")
 
 w2_stage_btns = tk.Frame(w2_input_frame)
 w2_stage_btns.grid(row=6, column=0, columnspan=2, pady=3)
-tk.Button(w2_stage_btns, text="CLEAR SETS",    command=w2_remove_staged_set, width=13).pack(side="left", padx=2)
-tk.Button(w2_stage_btns, text="PUT WAREHOUSE", command=w2_put_warehouse,     width=13).pack(side="left", padx=2)
+tip(tk.Button(w2_stage_btns, text="CLEAR SETS",    command=w2_remove_staged_set, width=13),
+    "Remove the selected staged set (or all sets if none selected).").pack(side="left", padx=2)
+tip(tk.Button(w2_stage_btns, text="PUT WAREHOUSE", command=w2_put_warehouse,     width=13),
+    "Commit all staged sets to Warehouse 2 and generate QR codes. Use GENERATE FILES to create PDF labels.").pack(side="left", padx=2)
 
 # Item Management (UPDATE / DELETE) for W2
 w2_item_mgmt_frame = tk.LabelFrame(w2_input_frame, text="Item Management", padx=6, pady=4)
 w2_item_mgmt_frame.grid(row=7, column=0, columnspan=2, pady=(6, 0), sticky="we")
+tip(w2_item_mgmt_frame, "Edit a staged set's details before committing it to the warehouse.")
 tk.Label(w2_item_mgmt_frame,
          text="Select a row in the staged sets table,\nthen use buttons below:",
-         font=("Arial", 8), fg="gray", justify="left").pack(anchor="w", pady=(0, 4))
+         font=("Helvetica", 8), fg="gray", justify="left").pack(anchor="w", pady=(0, 4))
 w2_item_action_btns = tk.Frame(w2_item_mgmt_frame)
 w2_item_action_btns.pack()
-tk.Button(w2_item_action_btns, text="UPDATE ITEM", command=w2_update_item,
-          bg="#1a5276", fg="white", width=13).pack(side="left", padx=2)
+tip(tk.Button(w2_item_action_btns, text="UPDATE ITEM", command=w2_update_item,
+          bg="#1a5276", fg="white", width=13),
+    "Edit the items in the selected staged set.").pack(side="left", padx=2)
 
 # Shelf Controls W2
 w2_shelf_mid = tk.Frame(w2_row1)
 w2_shelf_mid.pack(side="left", fill="both", expand=True, padx=5)
 w2_shelf_ctrl_frame = tk.LabelFrame(w2_shelf_mid, text="Shelf Control & Management", padx=10, pady=5)
 w2_shelf_ctrl_frame.pack(fill="x")
+tip(w2_shelf_ctrl_frame, "Manage shelf availability and add/remove shelves for Warehouse 2.")
 
 w2_status_ctrl = tk.LabelFrame(w2_shelf_ctrl_frame, text="Status Control", padx=8, pady=5)
 w2_status_ctrl.pack(fill="x", pady=(0, 5))
+tip(w2_status_ctrl, "Mark a shelf as FULL (no more items) or AVAILABLE.")
 w2_shelf_control_var = tk.StringVar()
 w2_shelf_control_dropdown = ttk.Combobox(w2_status_ctrl, textvariable=w2_shelf_control_var, width=22, state="readonly")
 w2_shelf_control_dropdown.pack(side="left", padx=5)
-tk.Button(w2_status_ctrl, text="SET FULL",      command=lambda: w2_set_shelf_status("FULL"),      width=10).pack(side="left", padx=3)
-tk.Button(w2_status_ctrl, text="SET AVAILABLE", command=lambda: w2_set_shelf_status("AVAILABLE"), width=12).pack(side="left", padx=3)
-tk.Button(w2_status_ctrl, text="↻",             command=w2_reset_shelf_control,                   width=3).pack(side="left", padx=3)
+tip(w2_shelf_control_dropdown, "Select the shelf whose status you want to change.")
+tip(tk.Button(w2_status_ctrl, text="SET FULL",      command=lambda: w2_set_shelf_status("FULL"),      width=10),
+    "Mark selected shelf as FULL — prevents new items from being placed there.").pack(side="left", padx=3)
+tip(tk.Button(w2_status_ctrl, text="SET AVAILABLE", command=lambda: w2_set_shelf_status("AVAILABLE"), width=12),
+    "Mark selected shelf as AVAILABLE — allows new items to be placed.").pack(side="left", padx=3)
+tip(tk.Button(w2_status_ctrl, text="↻",             command=w2_reset_shelf_control,                   width=3),
+    "Clear the shelf selection.").pack(side="left", padx=3)
 
 w2_add_remove = tk.LabelFrame(w2_shelf_ctrl_frame, text="Add / Remove", padx=8, pady=5)
 w2_add_remove.pack(fill="x")
+tip(w2_add_remove, "Add a new shelf by typing its name, or remove an existing empty shelf.")
 w2_remove_shelf_var = tk.StringVar()
 w2_remove_shelf_dropdown = ttk.Combobox(w2_add_remove, textvariable=w2_remove_shelf_var, width=22)
 w2_remove_shelf_dropdown.pack(side="left", padx=5)
-tk.Button(w2_add_remove, text="ADD",    command=w2_add_shelf,           ).pack(side="left", padx=3)
-tk.Button(w2_add_remove, text="REMOVE", command=w2_remove_shelf,         ).pack(side="left", padx=3)
-tk.Button(w2_add_remove, text="↻",      command=w2_reset_shelf_addition, width=3).pack(side="left", padx=3)
+tip(w2_remove_shelf_dropdown, "Type a new shelf name to add, or select an existing one to remove.")
+tip(tk.Button(w2_add_remove, text="ADD",    command=w2_add_shelf   ), "Add the typed shelf name as a new shelf.").pack(side="left", padx=3)
+tip(tk.Button(w2_add_remove, text="REMOVE", command=w2_remove_shelf ), "Remove the selected shelf (only if it has no items).").pack(side="left", padx=3)
+tip(tk.Button(w2_add_remove, text="↻",      command=w2_reset_shelf_addition, width=3), "Clear the shelf name field.").pack(side="left", padx=3)
 
 # View W2
 w2_view_frame = tk.LabelFrame(w2_row1, text="View", padx=10, pady=5)
 w2_view_frame.pack(side="right", fill="both", padx=5)
-for text, cmd in [
-    ("SHOW WAREHOUSE", w2_show_warehouse),
-    ("SHELF STATUS",   w2_show_available),
-    ("PULL HISTORY",   w2_show_pullouts),
-    ("STORED QR",      w2_show_qr_codes),
-    ("QR LABELS",      lambda: open_label_manager(warehouse=2)),
+tip(w2_view_frame, "Switch between different table views for Warehouse 2.")
+for text, cmd, tooltip in [
+    ("SHOW WAREHOUSE", w2_show_warehouse, "View all items currently stored in Warehouse 2."),
+    ("SHELF STATUS",   w2_show_available, "View each shelf's status and how many items it holds."),
+    ("PULL HISTORY",   w2_show_pullouts,  "View items that have been pulled out of Warehouse 2."),
+    ("QR LABELS",      lambda: open_label_manager(warehouse=2), "Open and manage printable QR label PDF files."),
+    ("VIEW EXCEL",     w2_view_excel,     "Open the last Excel file generated by GENERATE FILES for Warehouse 2."),
 ]:
-    tk.Button(w2_view_frame, text=text, command=cmd, width=15).pack(anchor="w", pady=3)
+    tip(tk.Button(w2_view_frame, text=text, command=cmd, width=15), tooltip).pack(anchor="w", pady=3)
 
 # Search & Filter W2
 w2_pullout_frame = tk.LabelFrame(w2_main, text="Warehouse 2", padx=10, pady=8)
@@ -2744,8 +4334,8 @@ w2_type_filter_var = tk.StringVar()
 ttk.Combobox(w2_sf_row1, textvariable=w2_type_filter_var,
              values=[""] + EQUIPMENT_TYPES, width=12, state="readonly").pack(side="left", padx=(0, 8))
 
-tk.Button(w2_sf_row1, text="🔍", command=w2_search_item,  width=3).pack(side="left", padx=3)
-tk.Button(w2_sf_row1, text="↻",  command=w2_clear_filters, width=3).pack(side="left", padx=3)
+tip(tk.Button(w2_sf_row1, text="🔍", command=w2_search_item,  width=3), "Search and filter the Warehouse 2 table.").pack(side="left", padx=3)
+tip(tk.Button(w2_sf_row1, text="↻",  command=w2_clear_filters, width=3), "Clear all search and filter fields.").pack(side="left", padx=3)
 
 # Row 2: date range (calendar pickers)
 w2_sf_row2 = tk.Frame(w2_search_filter)
@@ -2770,8 +4360,8 @@ w2_pull_reason_filter_entry = ttk.Combobox(w2_po_row1, textvariable=w2_pull_reas
 w2_pull_reason_filter_entry.pack(side="left", padx=(0, 8))
 w2_pull_date_from_var = tk.StringVar()
 w2_pull_date_to_var   = tk.StringVar()
-tk.Button(w2_po_row1, text="↻",  command=w2_reset_pull_out,      width=3).pack(side="left", padx=2)
-tk.Button(w2_po_row1, text="WAREHOUSE PULL", command=w2_pull_item, width=16).pack(side="left", padx=(10, 3))
+tip(tk.Button(w2_po_row1, text="↻",  command=w2_reset_pull_out,      width=3),  "Clear pull-out fields and reset the view.").pack(side="left", padx=2)
+tip(tk.Button(w2_po_row1, text="WAREHOUSE PULL", command=w2_pull_item, width=16), "Pull the selected item out of Warehouse 2. A pull reason is required.").pack(side="left", padx=(10, 3))
 
 # Status bar W2
 w2_status_bar = tk.Frame(w2_main)
@@ -2780,32 +4370,75 @@ w2_full_label   = tk.Label(w2_status_bar, text="FULL Shelves: None", fg="red"); 
 w2_search_label = tk.Label(w2_status_bar, text="", fg="blue");                   w2_search_label.pack(side="left", padx=10)
 w2_status_label = tk.Label(w2_status_bar, text="", fg="green");                  w2_status_label.pack(side="left", padx=10)
 
+# ── W2 Table toolbar (Select All + Stored QR) ──────────────
+w2_table_toolbar = tk.Frame(w2_main)
+w2_table_toolbar.pack(fill="x", padx=5, pady=(2, 0))
+
+def w2_toggle_select_all():
+    # If pull history is visible, toggle that instead
+    if tree_w2_pullouts.winfo_ismapped():
+        all_iids = list(tree_w2_pullouts.get_children())
+        checked  = [iid for iid in all_iids if w2_pull_row_checks.get(iid)]
+        new_state = len(checked) < len(all_iids)
+        for iid in all_iids:
+            w2_pull_row_checks[iid] = new_state
+            tree_w2_pullouts.set(iid, "CP0", "☑" if new_state else "☐")
+        return
+    all_iids = list(tree_w2_warehouse.get_children())
+    checked  = [iid for iid in all_iids if w2_row_checks.get(iid)]
+    new_state = len(checked) < len(all_iids)
+    for iid in all_iids:
+        w2_row_checks[iid] = new_state
+        tree_w2_warehouse.set(iid, "C0", "☑" if new_state else "☐")
+    _w2_refresh_select_all_label()
+
+w2_select_all_btn = tk.Button(w2_table_toolbar, text="SELECT ALL",
+    command=w2_toggle_select_all, width=12)
+w2_select_all_btn.pack(side="left", padx=(0, 6))
+tip(w2_select_all_btn, "Select or deselect all visible rows in the active table.")
+
+tip(tk.Button(w2_table_toolbar, text="GENERATE FILES", command=w2_generate_stored_qr,
+          bg="#6c3483", fg="white", width=15),
+    "Generate QR PNGs, PDF labels and Excel export for selected items.").pack(side="left", padx=(0, 6))
+tip(tk.Button(w2_table_toolbar, text="VIEW QR", command=w2_view_stored_qr,
+          bg="#1a5276", fg="white", width=10),
+    "View all existing QR codes without regenerating.").pack(side="left", padx=(0, 6))
+w2_back_to_stage_btn = tip(tk.Button(w2_table_toolbar, text="BACK TO STAGE", command=w2_unstage_from_warehouse,
+          bg="#117a65", fg="white", width=15),
+    "Move checked warehouse items back to the Set Staging list.")
+w2_back_to_stage_btn.pack(side="left", padx=(0, 6))
+w2_back_to_wh_btn = tip(tk.Button(w2_table_toolbar, text="BACK TO WAREHOUSE", command=w2_undo_pull,
+          bg="#922b21", fg="white", width=18),
+    "Restore checked pull history items back to Warehouse 2.")
+# Hidden by default; shown only when Pull History view is active
+
 # Tables W2
 w2_table_frame = tk.Frame(w2_main)
 w2_table_frame.pack(fill="both", expand=True, pady=5)
 
 tree_w2_warehouse = ttk.Treeview(w2_table_frame,
-    columns=("C1","C2","C3","C4","C5","C6","C7","C8","C9","C10","C11"), show='headings')
+    columns=("C0","C1","C2","C3","C4","C5","C6","C7","C8","C9","C10"), show='headings')
 for col, text, width in zip(
-    ("C1","C2","C3","C4","C5","C6","C7","C8","C9","C10","C11"),
-    ("QR","Set ID","Hostname","Equipment Type","Brand/Model","Serial Number","Checked By","Shelf","Status","Remarks","Date"),
-    (170,85,110,105,125,105,105,115,85,140,130)):
+    ("C0","C1","C2","C3","C4","C5","C6","C7","C8","C9","C10"),
+    ("✔","QR","Set ID","Hostname","Equipment Type","Serial Number","Checked By","Shelf","Status","Remarks","Date"),
+    (30,170,90,120,115,115,115,125,90,150,135)):
     tree_w2_warehouse.heading(col, text=text); tree_w2_warehouse.column(col, width=width)
+tree_w2_warehouse.column("C0", anchor="center", stretch=False)
 tree_w2_warehouse.bind("<<TreeviewSelect>>", w2_select_item)
-tree_w2_warehouse.bind("<Double-1>", w2_unstage_from_warehouse)
 
-tree_w2_available = ttk.Treeview(w2_table_frame, columns=("C1","C2","C3"), show='headings')
-for col, text, width in zip(("C1","C2","C3"), ("Shelf","Status","Date_Full"), (250,150,200)):
+tree_w2_available = ttk.Treeview(w2_table_frame, columns=("C1","C2","C3","C4"), show='headings')
+for col, text, width in zip(("C1","C2","C3","C4"), ("Shelf","Status","Items Stored","Date Set Full"), (250,140,110,200)):
     tree_w2_available.heading(col, text=text); tree_w2_available.column(col, width=width)
 
 tree_w2_pullouts = ttk.Treeview(w2_table_frame,
-    columns=("C1","C2","C3","C4","C5","C6","C7","C8","C9"), show='headings')
+    columns=("CP0","C1","C2","C3","C4","C5","C6","C7","C8","C9"), show='headings')
 for col, text, width in zip(
-    ("C1","C2","C3","C4","C5","C6","C7","C8","C9"),
-    ("Set ID","Hostname","Equipment Type","Brand/Model","Shelf","Status","Remarks","Pull Reason","Date"),
-    (85,110,115,130,110,80,160,180,130)):
+    ("CP0","C1","C2","C3","C4","C5","C6","C7","C8","C9"),
+    ("✔","Set ID","Hostname","Equipment Type","Serial Number","Shelf","Status","Remarks","Pull Reason","Date"),
+    (30,85,115,115,115,110,80,150,180,135)):
     tree_w2_pullouts.heading(col, text=text); tree_w2_pullouts.column(col, width=width)
-tree_w2_pullouts.bind("<Double-1>", w2_undo_pull)
+tree_w2_pullouts.column("CP0", anchor="center", stretch=False)
+tree_w2_pullouts.bind("<<TreeviewSelect>>", w2_select_pull_item)
 
 tree_w2_qr = ttk.Treeview(w2_table_frame, columns=("C1","C2","C3","C4"), show='headings')
 for col, text, width in zip(("C1","C2","C3","C4"),
