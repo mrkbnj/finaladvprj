@@ -1363,9 +1363,7 @@ def generate_stored_qr(warehouse=1):
             if os.path.exists(path):
                 try:
                     from openpyxl import load_workbook
-                    wb_peek = load_workbook(path, data_only=True)
-                    for ws_p in wb_peek.worksheets:
-                        ws_p.protection.sheet = False
+                    wb_peek = load_workbook(path, read_only=True)
                     sheet_name_cb["values"] = wb_peek.sheetnames
                     wb_peek.close()
                     return
@@ -1540,6 +1538,10 @@ def generate_stored_qr(warehouse=1):
         # --- Generate Excel ---
         excel_msg = ""
         try:
+            import stat
+            from openpyxl import load_workbook
+            from openpyxl import Workbook as _Workbook
+
             safe_fname = file_name_str.replace("/", "-").replace("\\", "-")
             if not safe_fname.lower().endswith(".xlsx"):
                 safe_fname += ".xlsx"
@@ -1550,62 +1552,96 @@ def generate_stored_qr(warehouse=1):
             if warehouse == 1:
                 cols_xl = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
                 records_xl = [
-                    {c: v for c, v in zip(cols_xl,
-                        [values[2], values[3], values[4], values[5], values[6], values[7], values[8]])}
+                    [values[2], values[3], values[4], values[5], values[6], values[7], values[8]]
                     for values in rows
                 ]
             else:
                 cols_xl = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
                 records_xl = [
-                    {c: v for c, v in zip(cols_xl,
-                        [values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10]])}
+                    [values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10]]
                     for values in rows
                 ]
 
-            df_xl = pd.DataFrame(records_xl, columns=cols_xl)
-            df_xl.insert(0, "Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            gen_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            header = ["Generated At"] + cols_xl
 
-            import stat
+            # ── Lift read-only if file exists ─────────────────────
             if os.path.exists(excel_path):
-                # Temporarily make writable so we can append
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetFileAttributesW(excel_path, 0x80)
+                except Exception:
+                    pass
                 os.chmod(excel_path, stat.S_IWRITE | stat.S_IREAD)
-                from openpyxl import load_workbook
-                wb_xl = load_workbook(excel_path, data_only=True)
-                # Strip any existing protection so rows can be read
-                for ws_p in wb_xl.worksheets:
-                    ws_p.protection.sheet = False
-                if sheet_name_str in wb_xl.sheetnames:
-                    # Sheet exists — append only rows not already present
+
+                # Read all existing sheets into plain Python lists (read_only=True is safe)
+                wb_read = load_workbook(excel_path, read_only=True)
+                existing_sheets = {}
+                for sname in wb_read.sheetnames:
+                    existing_sheets[sname] = [
+                        list(row) for row in wb_read[sname].iter_rows(values_only=True)
+                    ]
+                wb_read.close()
+
+                # Build a fresh workbook with all existing data preserved
+                wb_xl = _Workbook()
+                wb_xl.remove(wb_xl.active)  # remove blank default sheet
+                for sname, srows in existing_sheets.items():
+                    ws_p = wb_xl.create_sheet(sname)
+                    for row in srows:
+                        ws_p.append([v if v is not None else "" for v in row])
+
+                # Append new rows into target sheet, skipping duplicates
+                if sheet_name_str in existing_sheets:
                     ws_xl = wb_xl[sheet_name_str]
                     existing_xl_keys = set()
-                    for xl_row in ws_xl.iter_rows(min_row=2, values_only=True):
-                        if xl_row and xl_row[1] is not None:
+                    for row in existing_sheets[sheet_name_str][1:]:  # skip header row
+                        if row and len(row) > 2 and row[1] is not None:
                             if warehouse == 1:
-                                existing_xl_keys.add((str(xl_row[1]), str(xl_row[2])))
+                                existing_xl_keys.add((str(row[1]), str(row[2])))
                             else:
-                                existing_xl_keys.add((str(xl_row[1]), str(xl_row[3]), str(xl_row[4])))
-                    for rec in df_xl.itertuples(index=False):
-                        rec_list = list(rec)
+                                existing_xl_keys.add((str(row[1]), str(row[3]), str(row[4])))
+                    for rec in records_xl:
                         if warehouse == 1:
-                            key = (str(rec_list[1]), str(rec_list[2]))
+                            key = (str(rec[0]), str(rec[1]))
                         else:
-                            key = (str(rec_list[1]), str(rec_list[3]), str(rec_list[4]))
+                            key = (str(rec[0]), str(rec[2]), str(rec[3]))
                         if key not in existing_xl_keys:
-                            ws_xl.append(rec_list)
+                            ws_xl.append([gen_at] + [str(v) for v in rec])
                 else:
-                    # New sheet — create with header
                     ws_xl = wb_xl.create_sheet(sheet_name_str)
-                    ws_xl.append(["Generated At"] + cols_xl)
-                    for rec in df_xl.itertuples(index=False):
-                        ws_xl.append(list(rec))
-                wb_xl.save(excel_path)
-            else:
-                # Brand new file — no sheet protection on export files
-                with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-                    df_xl.to_excel(writer, sheet_name=sheet_name_str, index=False)
+                    ws_xl.append(header)
+                    for rec in records_xl:
+                        ws_xl.append([gen_at] + [str(v) for v in rec])
 
-            # Apply OS-level read-only so the file opens in view mode
+                for ws_p in wb_xl.worksheets:
+                    ws_p.protection.sheet = True
+                    ws_p.protection.enable()
+                wb_xl.save(excel_path)
+                wb_xl.close()
+
+            else:
+                # Brand new file
+                wb_xl = _Workbook()
+                ws_xl = wb_xl.active
+                ws_xl.title = sheet_name_str
+                ws_xl.append(header)
+                for rec in records_xl:
+                    ws_xl.append([gen_at] + [str(v) for v in rec])
+                for ws_p in wb_xl.worksheets:
+                    ws_p.protection.sheet = True
+                    ws_p.protection.enable()
+                wb_xl.save(excel_path)
+                wb_xl.close()
+
+            # ── Lock read-only via Windows API + chmod ────────────
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetFileAttributesW(excel_path, 0x01)
+            except Exception:
+                pass
             os.chmod(excel_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+
             excel_msg = f"Excel saved to:\n{excel_path}"
             _last_excel_path[warehouse] = excel_path
         except Exception as xl_err:
@@ -1707,7 +1743,7 @@ def view_excel(warehouse=None):
                 reverse=True
             )
             for f in files:
-                full_path = os.path.join(BASE_DIR, f)
+                full_path = os.path.join(xl_folder, f)
                 size_kb = round(os.path.getsize(full_path) / 1024, 1)
                 try:
                     mtime = os.path.getmtime(full_path)
@@ -1736,7 +1772,7 @@ def view_excel(warehouse=None):
                 cb = tk.Checkbutton(row_fr, variable=var, bg=bg,
                                     command=lambda: [_refresh_sel_count(), _repaint_rows()])
                 cb.pack(side="left", padx=(6, 0), pady=4)
-                for txt, w in [("All Warehouses", 16), (f, 34), (date_str, 22), (f"{size_kb} kb", 8)]:
+                for txt, w in [(warehouse_label, 16), (f, 34), (date_str, 22), (f"{size_kb} kb", 8)]:
                     lbl = tk.Label(row_fr, text=txt, bg=bg, anchor="w", width=w,
                                    font=("Helvetica", 9))
                     lbl.pack(side="left", padx=4, pady=4)
@@ -1778,10 +1814,14 @@ def view_excel(warehouse=None):
         if not messagebox.askyesno("Confirm Delete", prompt, parent=manager):
             return
         failed = []
-        import stat
+        import stat, ctypes
         for _, full_path, _, fname, _, _, _ in chosen:
             try:
                 if os.path.exists(full_path):
+                    try:
+                        ctypes.windll.kernel32.SetFileAttributesW(full_path, 0x80)
+                    except Exception:
+                        pass
                     os.chmod(full_path, stat.S_IWRITE | stat.S_IREAD)
                     os.remove(full_path)
             except Exception as e:
@@ -1797,7 +1837,7 @@ def view_excel(warehouse=None):
     btn_frame_m.pack(pady=8)
     tk.Button(btn_frame_m, text="☑", command=_toggle_all, width=4).pack(side="left", padx=4)
     tk.Button(btn_frame_m, text="OPEN", command=open_selected, width=10).pack(side="left", padx=4)
-    clear_btn = tk.Button(btn_frame_m, text="✕ DELETE", command=clear_selected,
+    clear_btn = tk.Button(btn_frame_m, text="✕", command=clear_selected,
                            width=10, bg="#922b21", fg="white", state="disabled")
     clear_btn.pack(side="left", padx=4)
 
@@ -3190,6 +3230,14 @@ def generate_qr_pdf(items_batch, custom_name=None):
     # ── Combine: existing items first, then new ones ──
     all_items = existing_items + new_items
 
+    # ── Lift OS read-only before writing (re-applied after via _lock_pdf) ──
+    if os.path.exists(pdf_path):
+        try:
+            import stat
+            os.chmod(pdf_path, stat.S_IWRITE | stat.S_IREAD)
+        except Exception:
+            pass
+
     # ── Render all items into a fresh PDF so grid is always packed ──
     pdf = FPDF(orientation='P', unit='mm', format='A4')
     pdf.set_auto_page_break(auto=False)
@@ -3559,7 +3607,7 @@ def switch_user():
 
     sw_win = tk.Toplevel(root)
     sw_win.title("Switch User — Login")
-    sw_win.geometry("320x260")
+    sw_win.geometry("320x290")
     sw_win.resizable(False, False)
     sw_win.transient(root)
     sw_win.grab_set()
@@ -3616,7 +3664,7 @@ def switch_user():
     u_entry.bind("<Return>", lambda e: pw_e.focus_set())
     tk.Button(sw_win, text="SWITCH USER", command=do_switch,
               bg="#2c3e50", fg="white", font=("Helvetica", 9, "bold"),
-              pady=4, width=18).pack(pady=(0, 10))
+              pady=4, padx=20).pack(pady=(0, 10))
     u_entry.focus_set()
     sw_win.wait_window()
 
@@ -3753,9 +3801,10 @@ def _show_register_window(parent):
             f"Account '{uv.get()}' created successfully!\nRole: {role}", parent=reg_win)
         reg_win.destroy()
 
-    tk.Button(reg_win, text="CREATE ACCOUNT", command=do_create,
-              bg="#1a5276", fg="white", font=("Helvetica", 9, "bold"),
-              pady=4).pack(pady=(4, 10))
+    btn_row = tk.Frame(reg_win, pady=10)
+    btn_row.pack()
+    tk.Button(btn_row, text="CREATE ACCOUNT", command=do_create,
+              font=("Helvetica", 10), bg="#1a5276", fg="white", padx=16, pady=4).pack(side="left")
     reg_win.focus_force()
     reg_win.wait_window()
 
@@ -3972,7 +4021,6 @@ tab1 = tk.Frame(notebook)
 tab2 = tk.Frame(notebook)
 notebook.add(tab1, text="  Warehouse 1 — Laptops")
 notebook.add(tab2, text="  Warehouse 2 — Computer Peripherals / Equipment")  
-
 # ══════════════════════════════════════════════════════════
 #  WAREHOUSE 1 TAB
 # ══════════════════════════════════════════════════════════
@@ -3981,7 +4029,7 @@ w1_main = tk.Frame(tab1)
 w1_main.pack(fill="both", expand=True, padx=8, pady=8)
 
 w1_row1 = tk.Frame(w1_main)
-w1_row1.pack(fill="x")
+w1_row1.pack(fill="both", expand=True)
 
 # Item Management
 input_frame = tk.LabelFrame(w1_row1, text="Item Management", padx=10, pady=5)
@@ -4023,10 +4071,13 @@ tip(tk.Button(crud_frame, text="UPDATE", command=update_item, width=8), "Update 
 tip(tk.Button(crud_frame, text="↻",      command=reset_ui,    width=3), "Clear all input fields and reset the view.").grid(row=0, column=2, padx=3)
 
 tk.Label(input_frame, text="Staged Items (Click to Edit)", fg="green", font=("Helvetica", 9, "bold")).grid(row=7, column=0, columnspan=2, sticky="w")
-staged_listbox = tk.Listbox(input_frame, height=4, width=32)
-staged_listbox.grid(row=8, column=0, columnspan=2, sticky="we", pady=3)
+staged_listbox = tk.Listbox(input_frame, width=32)
+staged_listbox.grid(row=8, column=0, columnspan=2, sticky="nswe", pady=3)
 staged_listbox.bind("<<ListboxSelect>>", select_staged_item)
 tip(staged_listbox, "Items waiting to be committed. Click a row to load it back into the fields for editing.")
+input_frame.rowconfigure(8, weight=1)
+input_frame.columnconfigure(0, weight=1)
+input_frame.columnconfigure(1, weight=1)
 
 staging_btn_frame = tk.Frame(input_frame)
 staging_btn_frame.grid(row=9, column=0, columnspan=2, pady=3)
@@ -4038,8 +4089,13 @@ tip(tk.Button(staging_btn_frame, text="PUT WAREHOUSE", command=put_warehouse,   
 # Shelf Controls W1
 shelf_mid_frame = tk.Frame(w1_row1)
 shelf_mid_frame.pack(side="left", fill="both", expand=True, padx=5)
-shelf_control_frame = tk.LabelFrame(shelf_mid_frame, text="Shelf Control & Management", padx=10, pady=5)
-shelf_control_frame.pack(fill="x")
+
+# Shelf + View sub-row (side by side inside shelf_mid_frame)
+w1_shelf_view_row = tk.Frame(shelf_mid_frame)
+w1_shelf_view_row.pack(fill="x")
+
+shelf_control_frame = tk.LabelFrame(w1_shelf_view_row, text="Shelf Control & Management", padx=10, pady=5)
+shelf_control_frame.pack(side="left", fill="both", expand=True)
 tip(shelf_control_frame, "Manage shelf availability and add/remove shelves for Warehouse 1.")
 
 status_control_frame = tk.LabelFrame(shelf_control_frame, text="Status Control", padx=8, pady=5)
@@ -4067,9 +4123,9 @@ tip(tk.Button(add_remove_frame, text="ADD",    command=add_shelf   ), "Add the t
 tip(tk.Button(add_remove_frame, text="REMOVE", command=remove_shelf ), "Remove the selected shelf (only if it has no items).").pack(side="left", padx=3)
 tip(tk.Button(add_remove_frame, text="↻",      command=reset_shelf_addition, width=3), "Clear the shelf name field.").pack(side="left", padx=3)
 
-# View W1
-view_frame = tk.LabelFrame(w1_row1, text="View", padx=10, pady=5)
-view_frame.pack(side="right", fill="both", padx=5)
+# View W1 — sits to the right of Shelf Control inside shelf_mid_frame
+view_frame = tk.LabelFrame(w1_shelf_view_row, text="View", padx=10, pady=5)
+view_frame.pack(side="left", fill="y", padx=(5, 0))
 tip(view_frame, "Switch between different table views for Warehouse 1.")
 for text, cmd, tooltip in [
     ("SHOW WAREHOUSE", show_warehouse,  "View all items currently stored in Warehouse 1."),
@@ -4081,7 +4137,7 @@ for text, cmd, tooltip in [
     tip(tk.Button(view_frame, text=text, command=cmd, width=15), tooltip).pack(anchor="w", pady=3)
 
 # Search & Filter W1
-w1_pullout_frame = tk.LabelFrame(w1_main, text="Warehouse 1", padx=10, pady=8)
+w1_pullout_frame = tk.LabelFrame(shelf_mid_frame, text="Warehouse 1", padx=10, pady=8)
 w1_pullout_frame.pack(fill="x", pady=5)
 
 w1_search_filter = tk.LabelFrame(w1_pullout_frame, text="Search & Filter", padx=8, pady=5)
@@ -4134,14 +4190,14 @@ tip(tk.Button(w1_po_row1, text="↻",  command=reset_pull_out,      width=3),  "
 tip(tk.Button(w1_po_row1, text="WAREHOUSE PULL", command=pull_item, width=16), "Pull the selected item out of Warehouse 1. A pull reason is required.").pack(side="left", padx=(10, 3))
 
 # Status bar W1
-w1_status_bar = tk.Frame(w1_main)
+w1_status_bar = tk.Frame(shelf_mid_frame)
 w1_status_bar.pack(fill="x")
 w1_full_label   = tk.Label(w1_status_bar, text="FULL Shelves: None", fg="red");  w1_full_label.pack(side="left", padx=10)
 w1_search_label = tk.Label(w1_status_bar, text="", fg="blue");                   w1_search_label.pack(side="left", padx=10)
 w1_status_label = tk.Label(w1_status_bar, text="", fg="green");                  w1_status_label.pack(side="left", padx=10)
 
 # ── W1 Table toolbar (Select All + Stored QR) ──────────────
-w1_table_toolbar = tk.Frame(w1_main)
+w1_table_toolbar = tk.Frame(shelf_mid_frame)
 w1_table_toolbar.pack(fill="x", padx=5, pady=(2, 0))
 
 def w1_toggle_select_all():
@@ -4182,7 +4238,7 @@ w1_back_to_wh_btn = tip(tk.Button(w1_table_toolbar, text="BACK TO WAREHOUSE", co
 # Hidden by default; shown only when Pull History view is active
 
 # Tables W1
-w1_table_frame = tk.Frame(w1_main)
+w1_table_frame = tk.Frame(shelf_mid_frame)
 w1_table_frame.pack(fill="both", expand=True, pady=5)
 
 tree_warehouse = ttk.Treeview(w1_table_frame, columns=("C0","C1","C2","C3","C4","C5","C6","C7","C8"), show='headings')
@@ -4217,7 +4273,7 @@ w2_main = tk.Frame(tab2)
 w2_main.pack(fill="both", expand=True, padx=8, pady=8)
 
 w2_row1 = tk.Frame(w2_main)
-w2_row1.pack(fill="x")
+w2_row1.pack(fill="both", expand=True)
 
 # Equipment selection + staging panel
 w2_input_frame = tk.LabelFrame(w2_row1, text="Set Staging", padx=10, pady=5)
@@ -4240,9 +4296,12 @@ tip(tk.Button(w2_input_frame, text="BUILD SET", command=w2_build_set,
 
 tip(tk.Label(w2_input_frame, text="Staged Sets", fg="green", font=("Helvetica", 9, "bold")),
     "Sets waiting to be committed to Warehouse 2.").grid(row=4, column=0, columnspan=2, sticky="w")
-w2_staged_listbox = tk.Listbox(w2_input_frame, height=5, width=34)
-w2_staged_listbox.grid(row=5, column=0, columnspan=2, sticky="we", pady=3)
+w2_staged_listbox = tk.Listbox(w2_input_frame, width=34)
+w2_staged_listbox.grid(row=5, column=0, columnspan=2, sticky="nswe", pady=3)
 tip(w2_staged_listbox, "Click a set to select it for editing. ⚠ means a required equipment type is missing.")
+w2_input_frame.rowconfigure(5, weight=1)
+w2_input_frame.columnconfigure(0, weight=1)
+w2_input_frame.columnconfigure(1, weight=1)
 
 w2_stage_btns = tk.Frame(w2_input_frame)
 w2_stage_btns.grid(row=6, column=0, columnspan=2, pady=3)
@@ -4267,8 +4326,13 @@ tip(tk.Button(w2_item_action_btns, text="UPDATE ITEM", command=w2_update_item,
 # Shelf Controls W2
 w2_shelf_mid = tk.Frame(w2_row1)
 w2_shelf_mid.pack(side="left", fill="both", expand=True, padx=5)
-w2_shelf_ctrl_frame = tk.LabelFrame(w2_shelf_mid, text="Shelf Control & Management", padx=10, pady=5)
-w2_shelf_ctrl_frame.pack(fill="x")
+
+# Shelf + View sub-row (side by side inside w2_shelf_mid)
+w2_shelf_view_row = tk.Frame(w2_shelf_mid)
+w2_shelf_view_row.pack(fill="x")
+
+w2_shelf_ctrl_frame = tk.LabelFrame(w2_shelf_view_row, text="Shelf Control & Management", padx=10, pady=5)
+w2_shelf_ctrl_frame.pack(side="left", fill="both", expand=True)
 tip(w2_shelf_ctrl_frame, "Manage shelf availability and add/remove shelves for Warehouse 2.")
 
 w2_status_ctrl = tk.LabelFrame(w2_shelf_ctrl_frame, text="Status Control", padx=8, pady=5)
@@ -4296,9 +4360,9 @@ tip(tk.Button(w2_add_remove, text="ADD",    command=w2_add_shelf   ), "Add the t
 tip(tk.Button(w2_add_remove, text="REMOVE", command=w2_remove_shelf ), "Remove the selected shelf (only if it has no items).").pack(side="left", padx=3)
 tip(tk.Button(w2_add_remove, text="↻",      command=w2_reset_shelf_addition, width=3), "Clear the shelf name field.").pack(side="left", padx=3)
 
-# View W2
-w2_view_frame = tk.LabelFrame(w2_row1, text="View", padx=10, pady=5)
-w2_view_frame.pack(side="right", fill="both", padx=5)
+# View W2 — sits to the right of Shelf Control inside w2_shelf_mid
+w2_view_frame = tk.LabelFrame(w2_shelf_view_row, text="View", padx=10, pady=5)
+w2_view_frame.pack(side="left", fill="y", padx=(5, 0))
 tip(w2_view_frame, "Switch between different table views for Warehouse 2.")
 for text, cmd, tooltip in [
     ("SHOW WAREHOUSE", w2_show_warehouse, "View all items currently stored in Warehouse 2."),
@@ -4310,7 +4374,7 @@ for text, cmd, tooltip in [
     tip(tk.Button(w2_view_frame, text=text, command=cmd, width=15), tooltip).pack(anchor="w", pady=3)
 
 # Search & Filter W2
-w2_pullout_frame = tk.LabelFrame(w2_main, text="Warehouse 2", padx=10, pady=8)
+w2_pullout_frame = tk.LabelFrame(w2_shelf_mid, text="Warehouse 2", padx=10, pady=8)
 w2_pullout_frame.pack(fill="x", pady=5)
 
 w2_search_filter = tk.LabelFrame(w2_pullout_frame, text="Search & Filter", padx=8, pady=5)
@@ -4364,14 +4428,14 @@ tip(tk.Button(w2_po_row1, text="↻",  command=w2_reset_pull_out,      width=3),
 tip(tk.Button(w2_po_row1, text="WAREHOUSE PULL", command=w2_pull_item, width=16), "Pull the selected item out of Warehouse 2. A pull reason is required.").pack(side="left", padx=(10, 3))
 
 # Status bar W2
-w2_status_bar = tk.Frame(w2_main)
+w2_status_bar = tk.Frame(w2_shelf_mid)
 w2_status_bar.pack(fill="x")
 w2_full_label   = tk.Label(w2_status_bar, text="FULL Shelves: None", fg="red");  w2_full_label.pack(side="left", padx=10)
 w2_search_label = tk.Label(w2_status_bar, text="", fg="blue");                   w2_search_label.pack(side="left", padx=10)
 w2_status_label = tk.Label(w2_status_bar, text="", fg="green");                  w2_status_label.pack(side="left", padx=10)
 
 # ── W2 Table toolbar (Select All + Stored QR) ──────────────
-w2_table_toolbar = tk.Frame(w2_main)
+w2_table_toolbar = tk.Frame(w2_shelf_mid)
 w2_table_toolbar.pack(fill="x", padx=5, pady=(2, 0))
 
 def w2_toggle_select_all():
@@ -4413,7 +4477,7 @@ w2_back_to_wh_btn = tip(tk.Button(w2_table_toolbar, text="BACK TO WAREHOUSE", co
 # Hidden by default; shown only when Pull History view is active
 
 # Tables W2
-w2_table_frame = tk.Frame(w2_main)
+w2_table_frame = tk.Frame(w2_shelf_mid)
 w2_table_frame.pack(fill="both", expand=True, pady=5)
 
 tree_w2_warehouse = ttk.Treeview(w2_table_frame,
@@ -4444,7 +4508,6 @@ tree_w2_qr = ttk.Treeview(w2_table_frame, columns=("C1","C2","C3","C4"), show='h
 for col, text, width in zip(("C1","C2","C3","C4"),
     ("Set ID","Equipment Type","QR UUID String","File Status (PNG)"), (100,120,380,130)):
     tree_w2_qr.heading(col, text=text); tree_w2_qr.column(col, width=width)
-
 # ── Init ──────────────────────────────────────────────────
 initialize_file()
 update_all_shelf_dropdowns()
