@@ -1,17 +1,3 @@
-"""
-Warehouse Management System
-Copyright (c) 2026 Mark Benjamin H. Acob - All Rights Reserved
-
-Proprietary Software - Internal Use Only
-This software is proprietary and confidential.
-Unauthorized copying, modification, or distribution is prohibited.
-
-A comprehensive warehouse management system with QR code generation,
-item staging, and shelf management capabilities.
-Warehouse 1: General IT Equipment
-Warehouse 2: Computer Peripherals (Monitor, Keyboard, Mouse, Headset)
-"""
-
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pandas as pd
@@ -21,7 +7,6 @@ import qrcode
 import re
 import hashlib
 from datetime import datetime
-
 import sys
 
 if getattr(sys, 'frozen', False):
@@ -42,6 +27,17 @@ QR_LABELS_FOLDER_W2 = os.path.join(QR_LABELS_FOLDER, "warehouse_2")
 EXCEL_FOLDER = os.path.join(BASE_DIR, "excel_exports")
 EXCEL_FOLDER_W1 = os.path.join(EXCEL_FOLDER, "warehouse_1")
 EXCEL_FOLDER_W2 = os.path.join(EXCEL_FOLDER, "warehouse_2")
+DUMP_FOLDER       = os.path.join(BASE_DIR, "dump")
+DUMP_EXCEL_W1     = os.path.join(DUMP_FOLDER, "excel_exports", "warehouse_1")
+DUMP_EXCEL_W2     = os.path.join(DUMP_FOLDER, "excel_exports", "warehouse_2")
+DUMP_LABELS_W1    = os.path.join(DUMP_FOLDER, "qr_labels", "warehouse_1")
+DUMP_LABELS_W2    = os.path.join(DUMP_FOLDER, "qr_labels", "warehouse_2")
+PULL_QR_FOLDER    = os.path.join(BASE_DIR, "pull_qrs")
+PULL_QR_FOLDER_W1 = os.path.join(PULL_QR_FOLDER, "warehouse_1")
+PULL_QR_FOLDER_W2 = os.path.join(PULL_QR_FOLDER, "warehouse_2")
+PULL_EXCEL_FOLDER    = os.path.join(BASE_DIR, "pull_excel")
+PULL_EXCEL_FOLDER_W1 = os.path.join(PULL_EXCEL_FOLDER, "warehouse_1")
+PULL_EXCEL_FOLDER_W2 = os.path.join(PULL_EXCEL_FOLDER, "warehouse_2")
 
 SHELVES = [
     "Area A", "Area B", "Area C",
@@ -119,7 +115,10 @@ w2_pull_row_checks: dict = {}  # W2 pull history table checkboxes
 def initialize_file():
     # Always ensure all folders exist
     for folder in (QR_FOLDER_W1, QR_FOLDER_W2, QR_LABELS_FOLDER_W1, QR_LABELS_FOLDER_W2,
-                   EXCEL_FOLDER_W1, EXCEL_FOLDER_W2):
+                   EXCEL_FOLDER_W1, EXCEL_FOLDER_W2,
+                   PULL_QR_FOLDER_W1, PULL_QR_FOLDER_W2,
+                   PULL_EXCEL_FOLDER_W1, PULL_EXCEL_FOLDER_W2,
+                   DUMP_EXCEL_W1, DUMP_EXCEL_W2, DUMP_LABELS_W1, DUMP_LABELS_W2):
         os.makedirs(folder, exist_ok=True)
 
     sheets_to_create = {}
@@ -401,12 +400,59 @@ def generate_qr(hostname, data, warehouse=1):
     qr_img.save(qr_path_for(hostname, warehouse))
 
 def delete_qr(hostname, warehouse=1):
+    """Move QR PNG to the dump folder (used only when an item is permanently deleted)."""
+    import shutil
+    path = qr_path_for(hostname, warehouse)
+    if os.path.exists(path):
+        try:
+            dump_qr_folder = os.path.join(DUMP_FOLDER, "qr_codes",
+                                          "warehouse_1" if warehouse == 1 else "warehouse_2")
+            os.makedirs(dump_qr_folder, exist_ok=True)
+            dest = os.path.join(dump_qr_folder, os.path.basename(path))
+            if os.path.exists(dest):
+                base, ext = os.path.splitext(os.path.basename(path))
+                dest = os.path.join(dump_qr_folder,
+                                    f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+            shutil.move(path, dest)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"QR file not moved to dump: {e}")
+
+def remove_qr(hostname, warehouse=1):
+    """Directly remove a QR PNG without archiving (used when unstaging back to staging)."""
     path = qr_path_for(hostname, warehouse)
     if os.path.exists(path):
         try:
             os.remove(path)
         except Exception as e:
-            messagebox.showwarning("Warning", f"QR file not deleted: {e}")
+            messagebox.showwarning("Warning", f"QR file could not be removed: {e}")
+
+def pull_qr_path_for(hostname, warehouse=1):
+    """Return the expected pull_qrs path for a hostname/qr_label."""
+    folder = PULL_QR_FOLDER_W1 if warehouse == 1 else PULL_QR_FOLDER_W2
+    return os.path.join(folder, f"{hostname.replace(' ', '_')}.png")
+
+def pull_qr(hostname, warehouse=1):
+    """Move QR PNG to the pull_qrs folder when an item is pulled out.
+    Overwrites any existing pull QR for the same key (no timestamp duplicates)."""
+    import shutil
+    path = qr_path_for(hostname, warehouse)
+    if os.path.exists(path):
+        try:
+            dest_folder = PULL_QR_FOLDER_W1 if warehouse == 1 else PULL_QR_FOLDER_W2
+            os.makedirs(dest_folder, exist_ok=True)
+            dest = pull_qr_path_for(hostname, warehouse)
+            shutil.move(path, dest)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"QR file not moved to pull_qrs: {e}")
+
+def delete_pull_qr(hostname, warehouse=1):
+    """Delete a QR PNG from the pull_qrs folder (used when item is removed from pull history)."""
+    path = pull_qr_path_for(hostname, warehouse)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception as e:
+            messagebox.showwarning("Warning", f"Pull QR file could not be removed: {e}")
 
 # ========== MINI CALENDAR PICKER ==========
 
@@ -651,6 +697,17 @@ def put_warehouse():
             if col not in df_items.columns:
                 df_items[col] = ""
 
+        # Re-check shelf FULL status at commit time (shelf may have changed since staging)
+        for _staged_item in staged_items:
+            _shelf_val = _staged_item["Shelf"]
+            _s_stat = df_shelves[df_shelves["Shelf"] == _shelf_val]["Status"].values
+            if len(_s_stat) > 0 and _s_stat[0] == "FULL":
+                messagebox.showerror("Error",
+                    f"Shelf '{_shelf_val}' is marked FULL.\n"
+                    f"Item '{_staged_item['Hostname']}' cannot be placed there.\n"
+                    "Edit or remove it from staging first.")
+                return
+
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for item in staged_items:
             qr_code = str(uuid.uuid4())
@@ -751,17 +808,42 @@ def delete_item():
 
     df_items = load_items()
     df_shelves = load_shelves()
-    # values: ☐(0), QR(1), Hostname(2), Serial(3), Checked By(4), Shelf(5), Status(6), Remarks(7), Date(8)
     hostname = tree_warehouse.item(selected[0], "values")[2]
 
-    if not messagebox.askyesno("Confirm Delete", f"Delete '{hostname}'?\nThis cannot be undone."):
+    if not messagebox.askyesno("Confirm Delete",
+            f"Move '{hostname}' to the dump folder?\n"
+            "It will no longer appear in the warehouse but can be recovered manually."):
         return
 
+    # Move QR to dump
     delete_qr(hostname, warehouse=1)
+
+    # Move the item row to dump/dumped_records.xlsx
+    import shutil
+    row = df_items[df_items["Hostname"] == hostname]
+    if not row.empty:
+        dump_file  = os.path.join(DUMP_FOLDER, "dumped_records.xlsx")
+        dump_sheet = "dumped_w1"
+        try:
+            if os.path.exists(dump_file):
+                existing = pd.read_excel(dump_file, sheet_name=None)
+                df_dump  = existing.get(dump_sheet, pd.DataFrame())
+            else:
+                df_dump = pd.DataFrame()
+            row_copy = row.copy()
+            row_copy["Dumped At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            df_dump = pd.concat([df_dump, row_copy], ignore_index=True)
+            with pd.ExcelWriter(dump_file, engine="openpyxl",
+                                mode="a" if os.path.exists(dump_file) else "w",
+                                if_sheet_exists="replace") as writer:
+                df_dump.to_excel(writer, sheet_name=dump_sheet, index=False)
+        except Exception as e:
+            messagebox.showwarning("Dump Warning", f"Record moved but dump log failed:\n{e}")
+
     df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
     save_warehouse_1(df_items, df_shelves)
-    save_log("DELETE ITEM", f"[W1] Hostname: {hostname}")
-    messagebox.showinfo("Deleted", "Record and QR code deleted")
+    save_log("DELETE ITEM (DUMPED)", f"[W1] Hostname: {hostname}")
+    messagebox.showinfo("Moved to Dump", f"'{hostname}' has been moved to the dump folder.")
     w1_refresh_all()
 
 def pull_search_live(event=None):
@@ -831,50 +913,105 @@ def pull_search_live(event=None):
             w1_search_label.config(text="")
 
 def pull_item():
-    hostname_input = pull_item_entry.get().strip()
     reason = pull_reason_filter_var.get().strip()
-    if not hostname_input:
-        messagebox.showerror("Error", "No item selected for pull out"); return
     if not reason:
         messagebox.showerror("Error", "Please enter a pull reason"); return
 
-    df_items = load_items()
-    df_shelves = load_shelves()
-    df_pullouts = load_pullouts()
-
-    # Exact match first, then case-insensitive partial match
-    match = df_items[df_items["Hostname"] == hostname_input]
-    if match.empty:
-        match = df_items[df_items["Hostname"].astype(str).str.lower().str.contains(hostname_input.lower(), na=False)]
-    if match.empty:
-        messagebox.showerror("Error", f"'{hostname_input}' not found in warehouse"); return
-    if len(match) > 1:
-        names = "\n".join(match["Hostname"].tolist())
-        messagebox.showerror("Error", f"Multiple matches found. Be more specific:\n{names}"); return
-
-    hostname = match.iloc[0]["Hostname"]
-    if not messagebox.askyesno("Confirm Pull Out", f"Pull out '{hostname}' from warehouse?\nReason: {reason}"):
+    # Collect checked rows; fall back to treeview selection; then fall back to search entry
+    checked = [iid for iid, state in w1_row_checks.items() if state]
+    if checked:
+        target_iids = checked
+    elif tree_warehouse.selection():
+        target_iids = list(tree_warehouse.selection())
+    else:
+        # Legacy: single item from search entry
+        hostname_input = pull_item_entry.get().strip()
+        if not hostname_input:
+            messagebox.showerror("Error", "Select or check item(s) to pull, or type a hostname"); return
+        df_items = load_items()
+        match = df_items[df_items["Hostname"] == hostname_input]
+        if match.empty:
+            match = df_items[df_items["Hostname"].astype(str).str.lower().str.contains(hostname_input.lower(), na=False)]
+        if match.empty:
+            messagebox.showerror("Error", f"'{hostname_input}' not found in warehouse"); return
+        if len(match) > 1:
+            names = "\n".join(match["Hostname"].tolist())
+            messagebox.showerror("Error", f"Multiple matches. Be more specific:\n{names}"); return
+        target_iids = None  # signal to use match directly below
+        hostname = match.iloc[0]["Hostname"]
+        item_row = match.iloc[0]
+        if not messagebox.askyesno("Confirm Pull Out",
+                f"Pull out '{hostname}'?\nReason: {reason}"):
+            return
+        df_items = load_items(); df_shelves = load_shelves(); df_pullouts = load_pullouts()
+        shelf = str(item_row.get("Shelf", ""))
+        pull_qr(hostname, warehouse=1)
+        df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
+        df_pullouts = pd.concat([df_pullouts, pd.DataFrame([{
+            "QR":            str(item_row.get("QR", "")),
+            "Hostname":      hostname,
+            "Serial Number": str(item_row.get("Serial Number", "")),
+            "Checked By":    str(item_row.get("Checked By", "")),
+            "Shelf":         shelf,
+            "Status":        str(item_row.get("Status", "")),
+            "Remarks":       str(item_row.get("Remarks", "")),
+            "Pull Reason":   reason,
+            "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }])], ignore_index=True)
+        save_warehouse_1(df_items, df_shelves, df_pullouts)
+        save_log("WAREHOUSE PULL", f"[W1] Hostname: {hostname} | Shelf: {shelf} | Reason: {reason}")
+        try:
+            all_reasons = sorted(load_pullouts()["Pull Reason"].dropna().unique().tolist())
+            pull_reason_filter_entry["values"] = [""] + all_reasons
+        except Exception:
+            pass
+        messagebox.showinfo("Success", f"'{hostname}' pulled out successfully")
+        pull_item_entry.delete(0, tk.END)
+        pull_reason_filter_var.set("")
+        w1_refresh_all()
         return
 
-    item_row = match.iloc[0]
-    shelf = str(item_row.get("Shelf", ""))
+    # ── Bulk pull from checked/selected rows ──────────────────
+    hostnames = [tree_warehouse.item(iid, "values")[2] for iid in target_iids]
+    if not messagebox.askyesno("Confirm Pull Out",
+            f"Pull out {len(hostnames)} item(s)?\n" +
+            "\n".join(hostnames) +
+            f"\n\nReason: {reason}"):
+        return
 
-    delete_qr(hostname, warehouse=1)
-    df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
-    df_pullouts = pd.concat([df_pullouts, pd.DataFrame([{
-        "Hostname": hostname,
-        "Serial Number": str(item_row.get("Serial Number", "")),
-        "Checked By": str(item_row.get("Checked By", "")),
-        "Shelf": shelf,
-        "Status": str(item_row.get("Status", "")),
-        "Remarks": str(item_row.get("Remarks", "")),
-        "Pull Reason": reason,
-        "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }])], ignore_index=True)
+    df_items   = load_items()
+    df_shelves = load_shelves()
+    df_pullouts = load_pullouts()
+    pulled = 0
+    for hostname in hostnames:
+        match = df_items[df_items["Hostname"] == hostname]
+        if match.empty:
+            continue
+        item_row = match.iloc[0]
+        shelf    = str(item_row.get("Shelf", ""))
+        pull_qr(hostname, warehouse=1)
+        df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
+        df_pullouts = pd.concat([df_pullouts, pd.DataFrame([{
+            "QR":            str(item_row.get("QR", "")),
+            "Hostname":      hostname,
+            "Serial Number": str(item_row.get("Serial Number", "")),
+            "Checked By":    str(item_row.get("Checked By", "")),
+            "Shelf":         shelf,
+            "Status":        str(item_row.get("Status", "")),
+            "Remarks":       str(item_row.get("Remarks", "")),
+            "Pull Reason":   reason,
+            "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }])], ignore_index=True)
+        save_log("WAREHOUSE PULL", f"[W1] Hostname: {hostname} | Shelf: {shelf} | Reason: {reason}")
+        pulled += 1
 
     save_warehouse_1(df_items, df_shelves, df_pullouts)
-    save_log("WAREHOUSE PULL", f"[W1] Hostname: {hostname} | Shelf: {shelf} | Reason: {reason}")
-    messagebox.showinfo("Success", f"'{hostname}' pulled out successfully")
+    try:
+        all_reasons = sorted(load_pullouts()["Pull Reason"].dropna().unique().tolist())
+        pull_reason_filter_entry["values"] = [""] + all_reasons
+    except Exception:
+        pass
+    messagebox.showinfo("Success", f"{pulled} item(s) pulled out successfully")
     pull_item_entry.delete(0, tk.END)
     pull_reason_filter_var.set("")
     w1_refresh_all()
@@ -890,6 +1027,30 @@ def undo_pull(event=None):
         messagebox.showinfo("Back to Warehouse", "Check at least one row in the Pull History table.")
         return
 
+    # Single confirmation for all selected items
+    preview = []
+    for item_id in checked:
+        v = tree_pullouts.item(item_id, "values")
+        if v:
+            preview.append(f"  • {v[1]}  (Shelf: {v[3]})")
+    if not messagebox.askyesno("Undo Pull",
+            f"Restore {len(preview)} item(s) back to Warehouse 1?\n\n" + "\n".join(preview)):
+        return
+
+    # ── Pre-validate: block entire restore if any target shelf is FULL ──
+    _df_sh_chk = load_shelves()
+    for item_id in checked:
+        _v = tree_pullouts.item(item_id, "values")
+        if not _v:
+            continue
+        _shelf = _v[3]
+        _s_stat = _df_sh_chk[_df_sh_chk["Shelf"] == _shelf]["Status"].values
+        if len(_s_stat) > 0 and _s_stat[0] == "FULL":
+            messagebox.showerror("Shelf Full",
+                f"Cannot restore — shelf '{_shelf}' is marked FULL.\n"
+                "Set it to AVAILABLE first, then retry.")
+            return
+
     restored = 0
     for item_id in checked:
         values = tree_pullouts.item(item_id, "values")
@@ -897,8 +1058,6 @@ def undo_pull(event=None):
             continue
         # values: ☐(0), Hostname(1), Serial(2), Shelf(3), Status(4), Remarks(5), PullReason(6), Date(7)
         hostname, shelf, status, remarks = values[1], values[3], values[4], values[5]
-        if not messagebox.askyesno("Undo Pull", f"Restore '{hostname}' back to the warehouse?\n\nShelf: {shelf}\nStatus: {status}"):
-            continue
 
         df_items = load_items()
         df_shelves = load_shelves()
@@ -914,12 +1073,25 @@ def undo_pull(event=None):
             continue
 
         pull_row = match.iloc[0]
-        qr_code = ""
-        try:
-            qr_code = str(uuid.uuid4())
-            generate_qr(hostname, qr_code, warehouse=1)
-        except Exception as e:
-            messagebox.showwarning("Warning", f"QR code not regenerated: {e}")
+
+        # ── Restore QR: move back from pull_qrs/ instead of regenerating ──
+        import shutil
+        pull_qr_file = pull_qr_path_for(hostname, warehouse=1)
+        wh_qr_file   = qr_path_for(hostname, warehouse=1)
+        qr_code = str(pull_row.get("QR", ""))
+        if os.path.exists(pull_qr_file):
+            try:
+                os.makedirs(QR_FOLDER_W1, exist_ok=True)
+                shutil.move(pull_qr_file, wh_qr_file)
+            except Exception as e:
+                messagebox.showwarning("Warning", f"QR file could not be moved back: {e}")
+        elif not os.path.exists(wh_qr_file):
+            # Fallback: regenerate only if truly missing from both locations
+            try:
+                qr_code = str(uuid.uuid4())
+                generate_qr(hostname, qr_code, warehouse=1)
+            except Exception as e:
+                messagebox.showwarning("Warning", f"QR code not regenerated: {e}")
 
         for col in ["Serial Number", "Checked By"]:
             if col not in df_items.columns:
@@ -956,6 +1128,16 @@ def unstage_from_warehouse(event=None):
         messagebox.showinfo("Back to Stage", "Check at least one row in the Warehouse table.")
         return
 
+    # Single confirmation for all selected items
+    preview = []
+    for item_id in checked:
+        v = tree_warehouse.item(item_id, "values")
+        if v:
+            preview.append(f"  • {v[2]}  (Shelf: {v[5]})")
+    if not messagebox.askyesno("Move to Staging",
+            f"Move {len(preview)} item(s) back to staging?\n\n" + "\n".join(preview)):
+        return
+
     moved = 0
     for item_id in checked:
         values = tree_warehouse.item(item_id, "values")
@@ -963,15 +1145,13 @@ def unstage_from_warehouse(event=None):
             continue
         # values: ☐(0), QR(1), Hostname(2), Serial(3), Checked By(4), Shelf(5), Status(6), Remarks(7), Date(8)
         hostname, serial, checked_by, shelf, status, remarks = values[2], values[3], values[4], values[5], values[6], values[7]
-        if not messagebox.askyesno("Move to Staging", f"Move '{hostname}' back to staging?\n\nShelf: {shelf}\nStatus: {status}"):
-            continue
         if any(item['Hostname'] == hostname for item in staged_items):
             messagebox.showerror("Error", f"'{hostname}' is already in staging")
             continue
 
         df_items = load_items()
         df_shelves = load_shelves()
-        delete_qr(hostname, warehouse=1)
+        remove_qr(hostname, warehouse=1)
         df_items = df_items[df_items["Hostname"] != hostname].reset_index(drop=True)
         save_warehouse_1(df_items, df_shelves)
         staged_items.append({"Hostname": hostname, "Serial Number": serial, "Checked By": checked_by, "Shelf": shelf, "Status": status, "Remarks": remarks})
@@ -1034,17 +1214,18 @@ def set_shelf_status(new_status):
 
 # ========== SHARED HELPERS ==========
 
-def _filter_by_date(df, date_from, date_to):
-    """Filter a DataFrame by date range. Both args are optional strings 'YYYY-MM-DD'."""
+def _filter_by_date(df, date_from, date_to, col="Date"):
+    """Filter a DataFrame by date range. Both args are optional strings 'YYYY-MM-DD'.
+    col: the column to filter on (default 'Date'; use 'Timestamp' for activity log)."""
     if not date_from and not date_to:
         return df
     try:
         df = df.copy()
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df[col] = pd.to_datetime(df[col], errors="coerce")
         if date_from:
-            df = df[df["Date"] >= pd.to_datetime(date_from)]
+            df = df[df[col] >= pd.to_datetime(date_from)]
         if date_to:
-            df = df[df["Date"] <= pd.to_datetime(date_to) + pd.Timedelta(days=1)]
+            df = df[df[col] <= pd.to_datetime(date_to) + pd.Timedelta(days=1)]
     except Exception:
         pass
     return df
@@ -1320,36 +1501,53 @@ def generate_stored_qr(warehouse=1):
             tk.Label(parent, text=text, font=("Helvetica", 8, "bold"), fg="#6c3483",
                      anchor="w").grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
 
+        # ── File type checkboxes ───────────────────────────────
+        tk.Label(form, text="Generate:", anchor="w", width=14).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        gen_pdf_var   = tk.BooleanVar(value=True)
+        gen_excel_var = tk.BooleanVar(value=True)
+        chk_frame = tk.Frame(form)
+        chk_frame.grid(row=0, column=1, columnspan=2, sticky="w", pady=(0, 4))
+        pdf_chk   = tk.Checkbutton(chk_frame, text="PDF Labels",   variable=gen_pdf_var)
+        excel_chk = tk.Checkbutton(chk_frame, text="Excel Export", variable=gen_excel_var)
+        pdf_chk.pack(side="left", padx=(0, 12))
+        excel_chk.pack(side="left")
+
         # ── PDF row ────────────────────────────────────────────
-        _section(form, "▸ PDF Label File", 0)
-        tk.Label(form, text="File Name:", anchor="w", width=14).grid(row=1, column=0, sticky="w", pady=3)
+        _section(form, "▸ PDF Label File", 1)
+        pdf_name_lbl = tk.Label(form, text="File Name:", anchor="w", width=14)
+        pdf_name_lbl.grid(row=2, column=0, sticky="w", pady=3)
         pdf_name_var = tk.StringVar(value="")
         pdf_name_cb  = ttk.Combobox(form, textvariable=pdf_name_var, width=28,
                                      values=existing_pdfs)
-        pdf_name_cb.grid(row=1, column=1, pady=3, padx=(4, 0))
-        tk.Label(form, text=".pdf", fg="gray", font=("Helvetica", 8)).grid(row=1, column=2, sticky="w", padx=(3, 0))
-        tk.Label(form, text="  ↳ Select existing PDF to append pages to, or type a new name",
-                 fg="gray", font=("Helvetica", 7)).grid(row=2, column=1, columnspan=2, sticky="w")
+        pdf_name_cb.grid(row=2, column=1, pady=3, padx=(4, 0))
+        tk.Label(form, text=".pdf", fg="gray", font=("Helvetica", 8)).grid(row=2, column=2, sticky="w", padx=(3, 0))
+        pdf_hint = tk.Label(form, text="  ↳ Select existing PDF to append pages to, or type a new name",
+                 fg="gray", font=("Helvetica", 7))
+        pdf_hint.grid(row=3, column=1, columnspan=2, sticky="w")
 
         # ── Excel file row ─────────────────────────────────────
-        _section(form, "▸ Excel File", 3)
-        tk.Label(form, text="File Name:", anchor="w", width=14).grid(row=4, column=0, sticky="w", pady=3)
+        _section(form, "▸ Excel File", 4)
+        excel_name_lbl = tk.Label(form, text="File Name:", anchor="w", width=14)
+        excel_name_lbl.grid(row=5, column=0, sticky="w", pady=3)
         file_name_var = tk.StringVar(value="")
         file_name_cb  = ttk.Combobox(form, textvariable=file_name_var, width=28,
                                       values=existing_excels)
-        file_name_cb.grid(row=4, column=1, pady=3, padx=(4, 0))
-        tk.Label(form, text=".xlsx", fg="gray", font=("Helvetica", 8)).grid(row=4, column=2, sticky="w", padx=(3, 0))
-        tk.Label(form, text="  ↳ Select existing Excel to append a sheet to, or type a new name",
-                 fg="gray", font=("Helvetica", 7)).grid(row=5, column=1, columnspan=2, sticky="w")
+        file_name_cb.grid(row=5, column=1, pady=3, padx=(4, 0))
+        tk.Label(form, text=".xlsx", fg="gray", font=("Helvetica", 8)).grid(row=5, column=2, sticky="w", padx=(3, 0))
+        excel_hint = tk.Label(form, text="  ↳ Select existing Excel to append a sheet to, or type a new name",
+                 fg="gray", font=("Helvetica", 7))
+        excel_hint.grid(row=6, column=1, columnspan=2, sticky="w")
 
         # ── Sheet name row — dynamically lists sheets when an existing Excel is chosen ──
-        _section(form, "▸ Excel Sheet", 6)
-        tk.Label(form, text="Sheet Name:", anchor="w", width=14).grid(row=7, column=0, sticky="w", pady=3)
+        _section(form, "▸ Excel Sheet", 7)
+        sheet_name_lbl = tk.Label(form, text="Sheet Name:", anchor="w", width=14)
+        sheet_name_lbl.grid(row=8, column=0, sticky="w", pady=3)
         sheet_name_var = tk.StringVar(value="")
         sheet_name_cb  = ttk.Combobox(form, textvariable=sheet_name_var, width=28)
-        sheet_name_cb.grid(row=7, column=1, pady=3, padx=(4, 0))
-        tk.Label(form, text="  ↳ New sheet name to add (existing sheet of same name will be replaced)",
-                 fg="gray", font=("Helvetica", 7)).grid(row=8, column=1, columnspan=2, sticky="w")
+        sheet_name_cb.grid(row=8, column=1, pady=3, padx=(4, 0))
+        sheet_hint = tk.Label(form, text="  ↳ New sheet name to add (existing sheet of same name will be replaced)",
+                 fg="gray", font=("Helvetica", 7))
+        sheet_hint.grid(row=9, column=1, columnspan=2, sticky="w")
 
         def _refresh_sheet_list(*_):
             """Populate sheet dropdown whenever the chosen Excel file changes."""
@@ -1374,24 +1572,43 @@ def generate_stored_qr(warehouse=1):
         file_name_cb.bind("<<ComboboxSelected>>", _refresh_sheet_list)
         file_name_var.trace_add("write", _refresh_sheet_list)
 
+        def _toggle_pdf_widgets(*_):
+            state = "normal" if gen_pdf_var.get() else "disabled"
+            pdf_name_cb.config(state=state)
+            pdf_name_lbl.config(fg="black" if gen_pdf_var.get() else "gray")
+            pdf_hint.config(fg="gray")
+
+        def _toggle_excel_widgets(*_):
+            state = "normal" if gen_excel_var.get() else "disabled"
+            file_name_cb.config(state=state)
+            sheet_name_cb.config(state=state)
+            excel_name_lbl.config(fg="black" if gen_excel_var.get() else "gray")
+            sheet_name_lbl.config(fg="black" if gen_excel_var.get() else "gray")
+            excel_hint.config(fg="gray")
+            sheet_hint.config(fg="gray")
+
+        gen_pdf_var.trace_add("write", _toggle_pdf_widgets)
+        gen_excel_var.trace_add("write", _toggle_excel_widgets)
+
         _wh_label = "Warehouse 1" if warehouse == 1 else "Warehouse 2"
         tk.Label(form, text=f"(Excel files saved to excel_exports/{_wh_label.lower().replace(' ', '_')}/)",
-                 fg="gray", font=("Helvetica", 8)).grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
+                 fg="gray", font=("Helvetica", 8)).grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         error_lbl = tk.Label(form, text="", fg="red", font=("Helvetica", 8))
-        error_lbl.grid(row=10, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        error_lbl.grid(row=11, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         confirmed = [False]
 
         def on_confirm():
-            pn = pdf_name_var.get().strip()
-            fn = file_name_var.get().strip()
-            sn = sheet_name_var.get().strip()
-            if not pn:
+            want_pdf   = gen_pdf_var.get()
+            want_excel = gen_excel_var.get()
+            if not want_pdf and not want_excel:
+                error_lbl.config(text="Please select at least one file type to generate."); return
+            if want_pdf and not pdf_name_var.get().strip():
                 error_lbl.config(text="Please enter a PDF file name."); return
-            if not fn:
+            if want_excel and not file_name_var.get().strip():
                 error_lbl.config(text="Please enter an Excel file name."); return
-            if not sn:
+            if want_excel and not sheet_name_var.get().strip():
                 error_lbl.config(text="Please enter a sheet name."); return
             confirmed[0] = True
             name_win.destroy()
@@ -1501,151 +1718,157 @@ def generate_stored_qr(warehouse=1):
 
         # --- Generate PDF ---
         pdf_msg = ""
-        try:
-            if warehouse == 1:
-                pdf_items = [
-                    {
-                        "Hostname":      str(values[2]),
-                        "Serial Number": str(values[3]),
-                        "Checked By":    str(values[4]),
-                        "Shelf":         str(values[5]),
-                        "Status":        str(values[6]),
-                        "Remarks":       str(values[7]),
-                        "_warehouse":    1,
-                    }
-                    for values in rows
-                ]
-            else:
-                pdf_items = [
-                    {
-                        "Set ID":         str(values[2]),
-                        "Hostname":       str(values[3]),
-                        "Equipment Type": str(values[4]),
-                        "Serial Number":  str(values[5]),
-                        "Checked By":     str(values[6]),
-                        "Shelf":          str(values[7]),
-                        "Status":         str(values[8]),
-                        "Remarks":        str(values[9]),
-                        "_warehouse":     2,
-                    }
-                    for values in rows
-                ]
-            pdf_path = generate_qr_pdf(pdf_items, custom_name=pdf_name_str)
-            pdf_msg = f"PDF saved to:\n{pdf_path}"
-        except Exception as pdf_err:
-            pdf_msg = f"PDF generation failed: {pdf_err}"
+        if gen_pdf_var.get():
+            try:
+                if warehouse == 1:
+                    pdf_items = [
+                        {
+                            "Hostname":      str(values[2]),
+                            "Serial Number": str(values[3]),
+                            "Checked By":    str(values[4]),
+                            "Shelf":         str(values[5]),
+                            "Status":        str(values[6]),
+                            "Remarks":       str(values[7]),
+                            "_warehouse":    1,
+                        }
+                        for values in rows
+                    ]
+                else:
+                    pdf_items = [
+                        {
+                            "Set ID":         str(values[2]),
+                            "Hostname":       str(values[3]),
+                            "Equipment Type": str(values[4]),
+                            "Serial Number":  str(values[5]),
+                            "Checked By":     str(values[6]),
+                            "Shelf":          str(values[7]),
+                            "Status":         str(values[8]),
+                            "Remarks":        str(values[9]),
+                            "_warehouse":     2,
+                        }
+                        for values in rows
+                    ]
+                pdf_path = generate_qr_pdf(pdf_items, custom_name=pdf_name_str)
+                pdf_msg = f"PDF saved to:\n{pdf_path}"
+            except Exception as pdf_err:
+                pdf_msg = f"PDF generation failed: {pdf_err}"
+        else:
+            pdf_msg = "PDF skipped."
 
         # --- Generate Excel ---
         excel_msg = ""
-        try:
-            import stat
-            from openpyxl import load_workbook
-            from openpyxl import Workbook as _Workbook
+        if gen_excel_var.get():
+            try:
+                import stat
+                from openpyxl import load_workbook
+                from openpyxl import Workbook as _Workbook
 
-            safe_fname = file_name_str.replace("/", "-").replace("\\", "-")
-            if not safe_fname.lower().endswith(".xlsx"):
-                safe_fname += ".xlsx"
-            xl_save_folder = EXCEL_FOLDER_W1 if warehouse == 1 else EXCEL_FOLDER_W2
-            os.makedirs(xl_save_folder, exist_ok=True)
-            excel_path = os.path.join(xl_save_folder, safe_fname)
+                safe_fname = file_name_str.replace("/", "-").replace("\\", "-")
+                if not safe_fname.lower().endswith(".xlsx"):
+                    safe_fname += ".xlsx"
+                xl_save_folder = EXCEL_FOLDER_W1 if warehouse == 1 else EXCEL_FOLDER_W2
+                os.makedirs(xl_save_folder, exist_ok=True)
+                excel_path = os.path.join(xl_save_folder, safe_fname)
 
-            if warehouse == 1:
-                cols_xl = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
-                records_xl = [
-                    [values[2], values[3], values[4], values[5], values[6], values[7], values[8]]
-                    for values in rows
-                ]
-            else:
-                cols_xl = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
-                records_xl = [
-                    [values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10]]
-                    for values in rows
-                ]
-
-            gen_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            header = ["Generated At"] + cols_xl
-
-            # ── Lift read-only if file exists ─────────────────────
-            if os.path.exists(excel_path):
-                try:
-                    import ctypes
-                    ctypes.windll.kernel32.SetFileAttributesW(excel_path, 0x80)
-                except Exception:
-                    pass
-                os.chmod(excel_path, stat.S_IWRITE | stat.S_IREAD)
-
-                # Read all existing sheets into plain Python lists (read_only=True is safe)
-                wb_read = load_workbook(excel_path, read_only=True)
-                existing_sheets = {}
-                for sname in wb_read.sheetnames:
-                    existing_sheets[sname] = [
-                        list(row) for row in wb_read[sname].iter_rows(values_only=True)
+                if warehouse == 1:
+                    cols_xl = ["Hostname", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+                    records_xl = [
+                        [values[2], values[3], values[4], values[5], values[6], values[7], values[8]]
+                        for values in rows
                     ]
-                wb_read.close()
-
-                # Build a fresh workbook with all existing data preserved
-                wb_xl = _Workbook()
-                wb_xl.remove(wb_xl.active)  # remove blank default sheet
-                for sname, srows in existing_sheets.items():
-                    ws_p = wb_xl.create_sheet(sname)
-                    for row in srows:
-                        ws_p.append([v if v is not None else "" for v in row])
-
-                # Append new rows into target sheet, skipping duplicates
-                if sheet_name_str in existing_sheets:
-                    ws_xl = wb_xl[sheet_name_str]
-                    existing_xl_keys = set()
-                    for row in existing_sheets[sheet_name_str][1:]:  # skip header row
-                        if row and len(row) > 2 and row[1] is not None:
-                            if warehouse == 1:
-                                existing_xl_keys.add((str(row[1]), str(row[2])))
-                            else:
-                                existing_xl_keys.add((str(row[1]), str(row[3]), str(row[4])))
-                    for rec in records_xl:
-                        if warehouse == 1:
-                            key = (str(rec[0]), str(rec[1]))
-                        else:
-                            key = (str(rec[0]), str(rec[2]), str(rec[3]))
-                        if key not in existing_xl_keys:
-                            ws_xl.append([gen_at] + [str(v) for v in rec])
                 else:
-                    ws_xl = wb_xl.create_sheet(sheet_name_str)
+                    cols_xl = ["Set ID", "Hostname", "Equipment Type", "Serial Number", "Checked By", "Shelf", "Status", "Remarks", "Date"]
+                    records_xl = [
+                        [values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[10]]
+                        for values in rows
+                    ]
+
+                gen_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                header = ["Generated At"] + cols_xl
+
+                # ── Lift read-only if file exists ─────────────────────
+                if os.path.exists(excel_path):
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.SetFileAttributesW(excel_path, 0x80)
+                    except Exception:
+                        pass
+                    os.chmod(excel_path, stat.S_IWRITE | stat.S_IREAD)
+
+                    # Read all existing sheets into plain Python lists (read_only=True is safe)
+                    wb_read = load_workbook(excel_path, read_only=True)
+                    existing_sheets = {}
+                    for sname in wb_read.sheetnames:
+                        existing_sheets[sname] = [
+                            list(row) for row in wb_read[sname].iter_rows(values_only=True)
+                        ]
+                    wb_read.close()
+
+                    # Build a fresh workbook with all existing data preserved
+                    wb_xl = _Workbook()
+                    wb_xl.remove(wb_xl.active)  # remove blank default sheet
+                    for sname, srows in existing_sheets.items():
+                        ws_p = wb_xl.create_sheet(sname)
+                        for row in srows:
+                            ws_p.append([v if v is not None else "" for v in row])
+
+                    # Append new rows into target sheet, skipping duplicates
+                    if sheet_name_str in existing_sheets:
+                        ws_xl = wb_xl[sheet_name_str]
+                        existing_xl_keys = set()
+                        for row in existing_sheets[sheet_name_str][1:]:  # skip header row
+                            if row and len(row) > 2 and row[1] is not None:
+                                if warehouse == 1:
+                                    existing_xl_keys.add((str(row[1]), str(row[2])))
+                                else:
+                                    existing_xl_keys.add((str(row[1]), str(row[3]), str(row[4])))
+                        for rec in records_xl:
+                            if warehouse == 1:
+                                key = (str(rec[0]), str(rec[1]))
+                            else:
+                                key = (str(rec[0]), str(rec[2]), str(rec[3]))
+                            if key not in existing_xl_keys:
+                                ws_xl.append([gen_at] + [str(v) for v in rec])
+                    else:
+                        ws_xl = wb_xl.create_sheet(sheet_name_str)
+                        ws_xl.append(header)
+                        for rec in records_xl:
+                            ws_xl.append([gen_at] + [str(v) for v in rec])
+
+                    for ws_p in wb_xl.worksheets:
+                        ws_p.protection.sheet = True
+                        ws_p.protection.enable()
+                    wb_xl.save(excel_path)
+                    wb_xl.close()
+
+                else:
+                    # Brand new file
+                    wb_xl = _Workbook()
+                    ws_xl = wb_xl.active
+                    ws_xl.title = sheet_name_str
                     ws_xl.append(header)
                     for rec in records_xl:
                         ws_xl.append([gen_at] + [str(v) for v in rec])
+                    for ws_p in wb_xl.worksheets:
+                        ws_p.protection.sheet = True
+                        ws_p.protection.enable()
+                    wb_xl.save(excel_path)
+                    wb_xl.close()
 
-                for ws_p in wb_xl.worksheets:
-                    ws_p.protection.sheet = True
-                    ws_p.protection.enable()
-                wb_xl.save(excel_path)
-                wb_xl.close()
+                # ── Lock read-only via Windows API + chmod ────────────
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetFileAttributesW(excel_path, 0x01)
+                except Exception:
+                    pass
+                os.chmod(excel_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
 
-            else:
-                # Brand new file
-                wb_xl = _Workbook()
-                ws_xl = wb_xl.active
-                ws_xl.title = sheet_name_str
-                ws_xl.append(header)
-                for rec in records_xl:
-                    ws_xl.append([gen_at] + [str(v) for v in rec])
-                for ws_p in wb_xl.worksheets:
-                    ws_p.protection.sheet = True
-                    ws_p.protection.enable()
-                wb_xl.save(excel_path)
-                wb_xl.close()
-
-            # ── Lock read-only via Windows API + chmod ────────────
-            try:
-                import ctypes
-                ctypes.windll.kernel32.SetFileAttributesW(excel_path, 0x01)
-            except Exception:
-                pass
-            os.chmod(excel_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
-
-            excel_msg = f"Excel saved to:\n{excel_path}"
-            _last_excel_path[warehouse] = excel_path
-        except Exception as xl_err:
-            excel_msg = f"Excel export failed: {xl_err}"
+                excel_msg = f"Excel saved to:\n{excel_path}"
+                _last_excel_path[warehouse] = excel_path
+            except Exception as xl_err:
+                excel_msg = f"Excel export failed: {xl_err}"
+        else:
+            excel_msg = "Excel skipped."
 
         messagebox.showinfo("Generate Files",
             f"{count_ok} QR code(s) processed.\n\n{pdf_msg}\n\n{excel_msg}")
@@ -1655,8 +1878,277 @@ def generate_stored_qr(warehouse=1):
     # ── 4. Open gallery filtered to the generated items ───────
     _open_qr_gallery(warehouse=warehouse, filter_keys=qr_keys)
 
-def w1_generate_stored_qr(): generate_stored_qr(warehouse=1)
-def w2_generate_stored_qr(): generate_stored_qr(warehouse=2)
+def _export_pull_history(warehouse=1):
+    """Export pull history rows to pull_excel/warehouse_X/.
+    Dialog mirrors Generate Files: file name dropdown + sheet name, supports appending."""
+    if warehouse == 1:
+        tree           = tree_pullouts
+        checks         = w1_pull_row_checks
+        pull_xl_folder = PULL_EXCEL_FOLDER_W1
+        wh_label       = "Warehouse_1"
+        cols           = ["Hostname", "Serial Number", "Shelf", "Status",
+                          "Remarks", "Pull Reason", "Date"]
+        col_indices    = [1, 2, 3, 4, 5, 6, 7]
+    else:
+        tree           = tree_w2_pullouts
+        checks         = w2_pull_row_checks
+        pull_xl_folder = PULL_EXCEL_FOLDER_W2
+        wh_label       = "Warehouse_2"
+        cols           = ["Set ID", "Hostname", "Equipment Type", "Serial Number",
+                          "Shelf", "Status", "Remarks", "Pull Reason", "Date"]
+        col_indices    = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    # Respect checkboxes first, fall back to all visible rows
+    checked = [iid for iid, state in checks.items() if state]
+    iids    = checked if checked else list(tree.get_children())
+
+    if not iids:
+        messagebox.showinfo("Export Pull History", "No pull history rows to export.")
+        return
+
+    rows      = [tree.item(iid, "values") for iid in iids]
+    records   = [{c: values[i] for c, i in zip(cols, col_indices)} for values in rows]
+    df_export = pd.DataFrame(records, columns=cols)
+    df_export.insert(0, "Exported At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # Scan pull_excel folder for existing files to populate dropdown
+    os.makedirs(pull_xl_folder, exist_ok=True)
+    existing_excels = sorted(
+        [f for f in os.listdir(pull_xl_folder) if f.lower().endswith(".xlsx")],
+        reverse=True
+    )
+
+    export_win = tk.Toplevel(root)
+    export_win.title(f"Export Pull History — {wh_label.replace('_', ' ')}")
+    export_win.resizable(False, False)
+    export_win.transient(root)
+    export_win.grab_set()
+
+    tk.Label(export_win,
+             text=f"Export {len(rows)} Pull History Row(s) to Excel",
+             font=("Helvetica", 10, "bold"), bg="#922b21", fg="white",
+             padx=10, pady=6).pack(fill="x")
+
+    form = tk.Frame(export_win, padx=16, pady=12)
+    form.pack()
+
+    def _section(text, row):
+        tk.Label(form, text=text, font=("Helvetica", 8, "bold"), fg="#922b21",
+                 anchor="w").grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 2))
+
+    # ── Excel file row ─────────────────────────────────────────────
+    _section("▸ Pull Excel File", 0)
+    tk.Label(form, text="File Name:", anchor="w", width=14).grid(row=1, column=0, sticky="w", pady=3)
+    file_name_var = tk.StringVar(value="")
+    file_name_cb  = ttk.Combobox(form, textvariable=file_name_var, width=28,
+                                  values=existing_excels)
+    file_name_cb.grid(row=1, column=1, pady=3, padx=(4, 0))
+    tk.Label(form, text=".xlsx", fg="gray", font=("Helvetica", 8)).grid(
+        row=1, column=2, sticky="w", padx=(3, 0))
+    tk.Label(form, text="  ↳ Select existing file to append a sheet to, or type a new name",
+             fg="gray", font=("Helvetica", 7)).grid(row=2, column=1, columnspan=2, sticky="w")
+
+    # ── Sheet name row ─────────────────────────────────────────────
+    _section("▸ Excel Sheet", 3)
+    tk.Label(form, text="Sheet Name:", anchor="w", width=14).grid(row=4, column=0, sticky="w", pady=3)
+    sheet_name_var = tk.StringVar(value="")
+    sheet_name_cb  = ttk.Combobox(form, textvariable=sheet_name_var, width=28)
+    sheet_name_cb.grid(row=4, column=1, pady=3, padx=(4, 0))
+    tk.Label(form, text="  ↳ New sheet name to add (existing sheet of same name will be replaced)",
+             fg="gray", font=("Helvetica", 7)).grid(row=5, column=1, columnspan=2, sticky="w")
+
+    def _refresh_sheet_list(*_):
+        chosen = file_name_var.get().strip()
+        if not chosen:
+            sheet_name_cb["values"] = []; return
+        safe = chosen if chosen.lower().endswith(".xlsx") else chosen + ".xlsx"
+        path = os.path.join(pull_xl_folder, safe.replace("/", "-").replace("\\", "-"))
+        if os.path.exists(path):
+            try:
+                from openpyxl import load_workbook
+                wb_peek = load_workbook(path, read_only=True)
+                sheet_name_cb["values"] = wb_peek.sheetnames
+                wb_peek.close()
+                return
+            except Exception:
+                pass
+        sheet_name_cb["values"] = []
+
+    file_name_cb.bind("<<ComboboxSelected>>", _refresh_sheet_list)
+    file_name_var.trace_add("write", _refresh_sheet_list)
+
+    _wh_label_display = "Warehouse 1" if warehouse == 1 else "Warehouse 2"
+    tk.Label(form,
+             text=f"(Files saved to pull_excel/{_wh_label_display.lower().replace(' ', '_')}/)",
+             fg="gray", font=("Helvetica", 8)).grid(
+        row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    error_lbl = tk.Label(form, text="", fg="red", font=("Helvetica", 8))
+    error_lbl.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+    confirmed = [False]
+
+    def on_confirm():
+        fn = file_name_var.get().strip()
+        sn = sheet_name_var.get().strip()
+        if not fn:
+            error_lbl.config(text="Please enter an Excel file name."); return
+        if not sn:
+            error_lbl.config(text="Please enter a sheet name."); return
+        confirmed[0] = True
+        export_win.destroy()
+
+    btn_row = tk.Frame(export_win, pady=10)
+    btn_row.pack()
+    tk.Button(btn_row, text="EXPORT", command=on_confirm,
+              bg="#922b21", fg="white", width=12).pack(side="left", padx=6)
+    tk.Button(btn_row, text="Cancel", command=export_win.destroy,
+              width=10).pack(side="left", padx=6)
+
+    export_win.update_idletasks()
+    px, py = root.winfo_rootx(), root.winfo_rooty()
+    pw, ph = root.winfo_width(), root.winfo_height()
+    nw, nh = export_win.winfo_reqwidth(), export_win.winfo_reqheight()
+    export_win.geometry(f"+{px+(pw-nw)//2}+{py+(ph-nh)//2}")
+    export_win.focus_force()
+    root.wait_window(export_win)
+
+    if not confirmed[0]:
+        return
+
+    file_name_str  = file_name_var.get().strip()
+    sheet_name_str = sheet_name_var.get().strip()
+
+    safe_xl = file_name_str.replace("/", "-").replace("\\", "-")
+    if not safe_xl.lower().endswith(".xlsx"):
+        safe_xl += ".xlsx"
+    out_path = os.path.join(pull_xl_folder, safe_xl)
+
+    # ── Check for already-exported rows ───────────────────────
+    already_in_excel = []
+    if os.path.exists(out_path):
+        try:
+            from openpyxl import load_workbook
+            wb_chk = load_workbook(out_path, read_only=True)
+            if sheet_name_str in wb_chk.sheetnames:
+                ws_chk = wb_chk[sheet_name_str]
+                existing_keys = set()
+                for xl_row in ws_chk.iter_rows(min_row=2, values_only=True):
+                    if xl_row and xl_row[1] is not None:
+                        if warehouse == 1:
+                            # col layout: Exported At(0), Hostname(1), Serial(2)...
+                            existing_keys.add((str(xl_row[1]), str(xl_row[2])))
+                        else:
+                            # col layout: Exported At(0), Set ID(1), Hostname(2), Equip Type(3), Serial(4)...
+                            existing_keys.add((str(xl_row[1]), str(xl_row[3]), str(xl_row[4])))
+                for values in rows:
+                    if warehouse == 1:
+                        key   = (str(values[1]), str(values[2]))
+                        label = f"  • {values[1]}  (Serial: {values[2]})"
+                    else:
+                        key   = (str(values[1]), str(values[3]), str(values[4]))
+                        label = f"  • {values[1]} — {values[3]}  (Serial: {values[4]})"
+                    if key in existing_keys:
+                        already_in_excel.append(label)
+            wb_chk.close()
+        except Exception:
+            pass
+
+    if already_in_excel:
+        msg = (
+            f"Some selected rows were already exported to '{file_name_str}' / sheet '{sheet_name_str}'  "
+            f"({len(already_in_excel)} item(s)):\n\n"
+            + "\n".join(already_in_excel)
+            + "\n\nDo you want to continue? (duplicates will be skipped)"
+        )
+        if not messagebox.askyesno("Already Exported", msg):
+            return
+
+    try:
+        import openpyxl
+        from openpyxl import load_workbook
+
+        # ── Build records, skipping duplicates ────────────────
+        existing_keys = set()
+        if os.path.exists(out_path):
+            try:
+                wb_read = load_workbook(out_path, read_only=True)
+                if sheet_name_str in wb_read.sheetnames:
+                    ws_read = wb_read[sheet_name_str]
+                    for xl_row in ws_read.iter_rows(min_row=2, values_only=True):
+                        if xl_row and xl_row[1] is not None:
+                            if warehouse == 1:
+                                existing_keys.add((str(xl_row[1]), str(xl_row[2])))
+                            else:
+                                existing_keys.add((str(xl_row[1]), str(xl_row[3]), str(xl_row[4])))
+                wb_read.close()
+            except Exception:
+                pass
+
+        new_records = []
+        for rec, values in zip(records, rows):
+            if warehouse == 1:
+                key = (str(values[1]), str(values[2]))
+            else:
+                key = (str(values[1]), str(values[3]), str(values[4]))
+            if key not in existing_keys:
+                new_records.append(rec)
+
+        if not new_records:
+            messagebox.showinfo("Export Complete", "No new rows to export — all selected items already exist in that sheet.")
+            return
+
+        df_new = pd.DataFrame(new_records, columns=cols)
+        df_new.insert(0, "Exported At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        if os.path.exists(out_path):
+            wb = load_workbook(out_path)
+            for ws_p in wb.worksheets:
+                ws_p.protection.sheet = False
+            if sheet_name_str in wb.sheetnames:
+                # Append new rows to existing sheet instead of replacing
+                ws = wb[sheet_name_str]
+                for row_data in df_new.itertuples(index=False, name=None):
+                    ws.append(list(row_data))
+            else:
+                ws = wb.create_sheet(title=sheet_name_str)
+                ws.append(list(df_new.columns))
+                for row_data in df_new.itertuples(index=False, name=None):
+                    ws.append(list(row_data))
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = sheet_name_str
+            ws.append(list(df_new.columns))
+            for row_data in df_new.itertuples(index=False, name=None):
+                ws.append(list(row_data))
+
+        for ws_p in wb.worksheets:
+            ws_p.protection.sheet = True
+            ws_p.protection.enable()
+        wb.save(out_path)
+        _last_excel_path[warehouse] = out_path
+        skipped = len(rows) - len(new_records)
+        skip_msg = f"\n{skipped} duplicate(s) skipped." if skipped else ""
+        messagebox.showinfo("Export Complete",
+            f"{len(new_records)} row(s) exported to:\n{out_path}"
+            f"\nSheet: '{sheet_name_str}'{skip_msg}\n\nUse VIEW EXCEL to open it.")
+    except PermissionError:
+        _excel_locked_error()
+    except Exception as e:
+        messagebox.showerror("Export Failed", f"Export failed:\n{e}")
+
+def w1_generate_stored_qr():
+    if tree_pullouts.winfo_ismapped():
+        _export_pull_history(warehouse=1)
+    else:
+        generate_stored_qr(warehouse=1)
+
+def w2_generate_stored_qr():
+    if tree_w2_pullouts.winfo_ismapped():
+        _export_pull_history(warehouse=2)
+    else:
+        generate_stored_qr(warehouse=2)
 
 def view_excel(warehouse=None):
     """Open an Excel file manager dialog similar to the QR Label Manager."""
@@ -1728,61 +2220,64 @@ def view_excel(warehouse=None):
         hdr_row = tk.Frame(inner_cl, bg="#dce3f0")
         hdr_row.pack(fill="x")
         tk.Label(hdr_row, text="✔", width=3, bg="#dce3f0", font=("Helvetica", 9, "bold")).pack(side="left", padx=(6,0))
-        for txt, w in [("Warehouse", 110), ("Filename", 240), ("Created", 155), ("Size", 60)]:
+        for txt, w in [("Warehouse", 110), ("Type", 100), ("Filename", 200), ("Created", 155), ("Size", 60)]:
             tk.Label(hdr_row, text=txt, width=w//7, bg="#dce3f0",
                      font=("Helvetica", 9, "bold"), anchor="w").pack(side="left", padx=4, pady=5)
 
         idx = 0
         for warehouse_label, wh_num in filtered:
-            # Scan warehouse-specific Excel export folder only
-            xl_folder = EXCEL_FOLDER_W1 if wh_num == 1 else EXCEL_FOLDER_W2
-            if not os.path.exists(xl_folder):
-                continue
-            files = sorted(
-                [f for f in os.listdir(xl_folder) if f.lower().endswith(".xlsx")],
-                reverse=True
-            )
-            for f in files:
-                full_path = os.path.join(xl_folder, f)
-                size_kb = round(os.path.getsize(full_path) / 1024, 1)
-                try:
-                    mtime = os.path.getmtime(full_path)
-                    file_dt = datetime.fromtimestamp(mtime)
-                    delta = now - file_dt
-                    age = "Today" if delta.days == 0 else ("1 day ago" if delta.days == 1 else f"{delta.days} days ago")
-                    date_str = f"{file_dt.strftime('%Y-%m-%d')}  ({age})"
-                except Exception:
-                    date_str = "Unknown"
+            # Scan both regular excel_exports AND pull_excel folders
+            folders_to_scan = [
+                (EXCEL_FOLDER_W1 if wh_num == 1 else EXCEL_FOLDER_W2, "Generated"),
+                (PULL_EXCEL_FOLDER_W1 if wh_num == 1 else PULL_EXCEL_FOLDER_W2, "Pull History"),
+            ]
+            for xl_folder, folder_type in folders_to_scan:
+                if not os.path.exists(xl_folder):
+                    continue
+                files = sorted(
+                    [f for f in os.listdir(xl_folder) if f.lower().endswith(".xlsx")],
+                    reverse=True
+                )
+                for f in files:
+                    full_path = os.path.join(xl_folder, f)
+                    size_kb = round(os.path.getsize(full_path) / 1024, 1)
+                    try:
+                        mtime = os.path.getmtime(full_path)
+                        file_dt = datetime.fromtimestamp(mtime)
+                        delta = now - file_dt
+                        age = "Today" if delta.days == 0 else ("1 day ago" if delta.days == 1 else f"{delta.days} days ago")
+                        date_str = f"{file_dt.strftime('%Y-%m-%d')}  ({age})"
+                    except Exception:
+                        date_str = "Unknown"
 
-                iid = f"row{idx}"
-                var = tk.BooleanVar(value=False)
-                check_vars[iid] = var
-                bg = EVEN_BG if idx % 2 == 0 else ODD_BG
+                    iid = f"row{idx}"
+                    var = tk.BooleanVar(value=False)
+                    check_vars[iid] = var
+                    bg = EVEN_BG if idx % 2 == 0 else ODD_BG
 
-                row_fr = tk.Frame(inner_cl, bg=bg, name=f"row_{iid}", cursor="hand2")
-                row_fr.pack(fill="x")
+                    row_fr = tk.Frame(inner_cl, bg=bg, name=f"row_{iid}", cursor="hand2")
+                    row_fr.pack(fill="x")
 
-                def _make_toggle(v=var):
-                    def _toggle(e=None):
-                        v.set(not v.get())
-                        _refresh_sel_count()
-                        _repaint_rows()
-                    return _toggle
+                    def _make_toggle(v=var):
+                        def _toggle(e=None):
+                            v.set(not v.get())
+                            _refresh_sel_count()
+                            _repaint_rows()
+                        return _toggle
 
-                cb = tk.Checkbutton(row_fr, variable=var, bg=bg,
-                                    command=lambda: [_refresh_sel_count(), _repaint_rows()])
-                cb.pack(side="left", padx=(6, 0), pady=4)
-                for txt, w in [(warehouse_label, 16), (f, 34), (date_str, 22), (f"{size_kb} kb", 8)]:
-                    lbl = tk.Label(row_fr, text=txt, bg=bg, anchor="w", width=w,
-                                   font=("Helvetica", 9))
-                    lbl.pack(side="left", padx=4, pady=4)
-                    lbl.bind("<Button-1>", _make_toggle(var))
-                row_fr.bind("<Button-1>", _make_toggle(var))
+                    cb = tk.Checkbutton(row_fr, variable=var, bg=bg,
+                                        command=lambda: [_refresh_sel_count(), _repaint_rows()])
+                    cb.pack(side="left", padx=(6, 0), pady=4)
+                    for txt, w in [(warehouse_label, 16), (folder_type, 14), (f, 28), (date_str, 22), (f"{size_kb} kb", 8)]:
+                        lbl = tk.Label(row_fr, text=txt, bg=bg, anchor="w", width=w,
+                                       font=("Helvetica", 9))
+                        lbl.pack(side="left", padx=4, pady=4)
+                        lbl.bind("<Button-1>", _make_toggle(var))
+                    row_fr.bind("<Button-1>", _make_toggle(var))
 
-                row_data.append((iid, full_path, warehouse_label, f, date_str, f"{size_kb} kb", var))
-                idx += 1
-            # Only show files once (not duplicated per warehouse label)
-            break
+                    # Store full_path and folder_type so clear_selected can dump correctly
+                    row_data.append((iid, full_path, warehouse_label, f, date_str, f"{size_kb} kb", var, folder_type, wh_num))
+                    idx += 1
 
         if idx == 0:
             tk.Label(inner_cl, text="No generated Excel files found.", fg="gray",
@@ -1807,15 +2302,23 @@ def view_excel(warehouse=None):
     def clear_selected():
         chosen = [rd for rd in row_data if rd[6].get()]
         if not chosen:
-            messagebox.showwarning("Warning", "Check at least one file to delete.", parent=manager); return
+            messagebox.showwarning("Warning", "Check at least one file to move to dump.", parent=manager); return
         count = len(chosen)
-        prompt = (f"Delete '{chosen[0][3]}'?" if count == 1
-                  else f"Delete {count} checked file(s)?\nThis cannot be undone.")
-        if not messagebox.askyesno("Confirm Delete", prompt, parent=manager):
+        prompt = (f"Move '{chosen[0][3]}' to dump?" if count == 1
+                  else f"Move {count} checked file(s) to dump?\nThey can be recovered from the dump folder.")
+        if not messagebox.askyesno("Confirm Move to Dump", prompt, parent=manager):
             return
+        import shutil, stat, ctypes
         failed = []
-        import stat, ctypes
-        for _, full_path, _, fname, _, _, _ in chosen:
+        for rd in chosen:
+            _, full_path, _, fname, _, _, _, folder_type, wh_num = rd
+            # Route to the correct dump subfolder based on file type and warehouse
+            if folder_type == "Pull History":
+                dump_folder = os.path.join(DUMP_FOLDER, "pull_excel",
+                                           "warehouse_1" if wh_num == 1 else "warehouse_2")
+            else:
+                dump_folder = DUMP_EXCEL_W1 if wh_num == 1 else DUMP_EXCEL_W2
+            os.makedirs(dump_folder, exist_ok=True)
             try:
                 if os.path.exists(full_path):
                     try:
@@ -1823,14 +2326,19 @@ def view_excel(warehouse=None):
                     except Exception:
                         pass
                     os.chmod(full_path, stat.S_IWRITE | stat.S_IREAD)
-                    os.remove(full_path)
+                    dest = os.path.join(dump_folder, fname)
+                    if os.path.exists(dest):
+                        base, ext = os.path.splitext(fname)
+                        dest = os.path.join(dump_folder,
+                                            f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+                    shutil.move(full_path, dest)
             except Exception as e:
                 failed.append(f"{fname}: {e}")
         load_excel_files()
         if failed:
-            messagebox.showerror("Error", "Some files could not be deleted:\n" + "\n".join(failed), parent=manager)
+            messagebox.showerror("Error", "Some files could not be moved:\n" + "\n".join(failed), parent=manager)
         else:
-            messagebox.showinfo("Deleted", f"{count} file(s) deleted.", parent=manager)
+            messagebox.showinfo("Moved to Dump", f"{count} file(s) moved to dump folder.", parent=manager)
 
     # ── Bottom toolbar ───────────────────────────────────────
     btn_frame_m = tk.Frame(manager)
@@ -1847,40 +2355,142 @@ def w1_view_excel(): view_excel(warehouse=1)
 def w2_view_excel(): view_excel(warehouse=2)
 
 def view_stored_qr(warehouse=1):
-    """Open the QR gallery filtered to items currently visible in the warehouse table.
-    If no filter is active, shows all existing QR PNG files."""
-    folder = QR_FOLDER_W1 if warehouse == 1 else QR_FOLDER_W2
-    if not os.path.exists(folder):
-        messagebox.showinfo("View QR", "No QR codes folder found.")
-        return
-    files = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
-    if not files:
-        messagebox.showinfo("View QR", "No QR codes have been generated yet.")
-        return
+    """Open the QR gallery.
+    - Pull History table active → reads from pull_qrs/ folder directly.
+    - Warehouse table active   → reads from qr_codes/ via _open_qr_gallery."""
+    pull_active = (tree_pullouts.winfo_ismapped() if warehouse == 1
+                   else tree_w2_pullouts.winfo_ismapped())
 
-    # Build filter_keys from what is currently visible in the warehouse tree
-    if warehouse == 1:
-        visible_iids = list(tree_warehouse.get_children())
-        if visible_iids:
-            filter_keys = []
-            for iid in visible_iids:
-                values = tree_warehouse.item(iid, "values")
-                # values: ☐(0), QR(1), Hostname(2), ...
-                filter_keys.append(str(values[2]))
+    if pull_active:
+        # ── Pull QR gallery — reads PNGs straight from pull_qrs/ ──
+        folder = PULL_QR_FOLDER_W1 if warehouse == 1 else PULL_QR_FOLDER_W2
+        if not os.path.exists(folder):
+            messagebox.showinfo("View QR", "No pull QR codes folder found."); return
+        files = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
+        if not files:
+            messagebox.showinfo("View QR", "No QR codes for pulled items yet."); return
+
+        # Build filter_keys from visible pull history rows
+        if warehouse == 1:
+            visible_iids = list(tree_pullouts.get_children())
+            # pull tree W1: CP0(0), Hostname(1), Serial(2), Shelf(3)...
+            filter_keys = (
+                [str(tree_pullouts.item(iid, "values")[1]) for iid in visible_iids]
+                if visible_iids else None
+            )
         else:
-            filter_keys = [os.path.splitext(f)[0].replace("_", " ") for f in files]
+            visible_iids = list(tree_w2_pullouts.get_children())
+            # pull tree W2: CP0(0), Set ID(1), Hostname(2), Equip Type(3)...
+            filter_keys = (
+                [f"{tree_w2_pullouts.item(iid, 'values')[1]}-{tree_w2_pullouts.item(iid, 'values')[3]}"
+                 for iid in visible_iids]
+                if visible_iids else None
+            )
+
+        from PIL import Image, ImageTk
+        bg_color  = "#2c3e50" if warehouse == 1 else "#1a5276"
+        btn_color = "#1a252f" if warehouse == 1 else "#154360"
+
+        qr_win = tk.Toplevel(root)
+        qr_win.title(f"Pull QR Codes — Warehouse {warehouse}")
+        qr_win.geometry("860x560")
+
+        toolbar = tk.Frame(qr_win, bg=bg_color)
+        toolbar.pack(fill="x")
+        tk.Label(toolbar, text=f"Pull QR Codes — Warehouse {warehouse}",
+                 bg=bg_color, fg="white", font=("Helvetica", 10, "bold")).pack(side="left", padx=10, pady=6)
+        search_var = tk.StringVar()
+        tk.Label(toolbar, text="Search:", bg=bg_color, fg="white").pack(side="left", padx=(20, 2))
+        tk.Entry(toolbar, textvariable=search_var, width=18).pack(side="left", pady=4)
+        count_lbl = tk.Label(toolbar, text="", bg=bg_color, fg="#aed6f1")
+        count_lbl.pack(side="left", padx=10)
+
+        container = tk.Frame(qr_win)
+        container.pack(fill="both", expand=True)
+        canvas_qr = tk.Canvas(container, bg="#f4f6f7", highlightthickness=0)
+        sb_qr = ttk.Scrollbar(container, orient="vertical", command=canvas_qr.yview)
+        canvas_qr.configure(yscrollcommand=sb_qr.set)
+        sb_qr.pack(side="right", fill="y")
+        canvas_qr.pack(side="left", fill="both", expand=True)
+        canvas_qr.bind("<MouseWheel>",
+                       lambda e: canvas_qr.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+        inner = tk.Frame(canvas_qr, bg="#f4f6f7")
+        cw_id = canvas_qr.create_window((0, 0), window=inner, anchor="nw")
+        _img_refs = []
+
+        def _load_pull_gallery(keyword=""):
+            for w in inner.winfo_children():
+                w.destroy()
+            _img_refs.clear()
+            COLS, THUMB, PAD = 4, 120, 14
+            row_f = col_f = shown = 0
+
+            for fname in sorted(files):
+                # Restore the key the same way qr_path_for stored it
+                key = os.path.splitext(fname)[0].replace("_", " ")
+                if filter_keys is not None and key not in filter_keys:
+                    continue
+                if keyword and keyword.lower() not in key.lower():
+                    continue
+
+                path = os.path.join(folder, fname)
+                cell = tk.Frame(inner, bg="white", bd=1, relief="solid", padx=PAD, pady=PAD)
+                cell.grid(row=row_f, column=col_f, padx=8, pady=8, sticky="n")
+                try:
+                    img   = Image.open(path).resize((THUMB, THUMB), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    _img_refs.append(photo)
+                    tk.Label(cell, image=photo, bg="white").pack()
+                except Exception:
+                    tk.Label(cell, text="[Error]", bg="white", fg="red", width=14).pack()
+                tk.Label(cell, text=key, bg="white", font=("Helvetica", 8, "bold"),
+                         fg="#2c3e50", wraplength=130).pack(pady=(4, 0))
+
+                col_f += 1; shown += 1
+                if col_f >= COLS:
+                    col_f = 0; row_f += 1
+
+            if shown == 0:
+                tk.Label(inner, text="No QR codes found.", bg="#f4f6f7",
+                         font=("Helvetica", 10), fg="gray").grid(row=0, column=0, padx=20, pady=40)
+            count_lbl.config(text=f"{shown} QR code(s)")
+            inner.update_idletasks()
+            canvas_qr.configure(scrollregion=canvas_qr.bbox("all"))
+            canvas_qr.itemconfigure(cw_id, width=canvas_qr.winfo_width())
+
+        tk.Button(toolbar, text="↻", command=lambda: _load_pull_gallery(search_var.get()),
+                  bg=btn_color, fg="white", relief="flat", padx=8).pack(side="right", padx=8, pady=4)
+        canvas_qr.bind("<Configure>",
+                       lambda e: canvas_qr.itemconfigure(cw_id, width=e.width))
+        search_var.trace_add("write", lambda *_: _load_pull_gallery(search_var.get()))
+        _load_pull_gallery()
+
     else:
-        visible_iids = list(tree_w2_warehouse.get_children())
-        if visible_iids:
-            filter_keys = []
-            for iid in visible_iids:
-                values = tree_w2_warehouse.item(iid, "values")
-                # values: ☐(0), QR(1), Set ID(2), Hostname(3), Equip Type(4), ...
-                filter_keys.append(f"{values[2]}-{values[4]}")
+        # ── Warehouse QR gallery — original behaviour ──────────────
+        folder = QR_FOLDER_W1 if warehouse == 1 else QR_FOLDER_W2
+        if not os.path.exists(folder):
+            messagebox.showinfo("View QR", "No QR codes folder found."); return
+        files = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
+        if not files:
+            messagebox.showinfo("View QR", "No QR codes have been generated yet."); return
+        if warehouse == 1:
+            visible_iids = list(tree_warehouse.get_children())
+            if visible_iids:
+                filter_keys = [str(tree_warehouse.item(iid, "values")[2])
+                               for iid in visible_iids]
+            else:
+                filter_keys = [os.path.splitext(f)[0].replace("_", " ") for f in files]
         else:
-            filter_keys = [os.path.splitext(f)[0].replace("_", " ") for f in files]
-
-    _open_qr_gallery(warehouse=warehouse, filter_keys=filter_keys)
+            visible_iids = list(tree_w2_warehouse.get_children())
+            if visible_iids:
+                filter_keys = [
+                    f"{tree_w2_warehouse.item(iid, 'values')[2]}-{tree_w2_warehouse.item(iid, 'values')[4]}"
+                    for iid in visible_iids
+                ]
+            else:
+                filter_keys = [os.path.splitext(f)[0].replace("_", " ") for f in files]
+        _open_qr_gallery(warehouse=warehouse, filter_keys=filter_keys)
 
 def w1_view_stored_qr(): view_stored_qr(warehouse=1)
 def w2_view_stored_qr(): view_stored_qr(warehouse=2)
@@ -2318,6 +2928,11 @@ def w2_build_set():
             if not status:
                 error_lbl.config(text=f"Please select a Status for {eq_type}"); return
 
+            _df_sh_chk = load_shelves_w2()
+            _sh_status = _df_sh_chk[_df_sh_chk["Shelf"] == shelf]["Status"].values
+            if len(_sh_status) > 0 and _sh_status[0] == "FULL":
+                error_lbl.config(text=f"Shelf '{shelf}' is marked FULL ({eq_type})"); return
+
             if serial in existing_serials_w2:
                 error_lbl.config(text=f"Serial '{serial}' already exists in Warehouse 2"); return
             if serial in staged_serials:
@@ -2385,6 +3000,20 @@ def w2_put_warehouse():
 
     try:
         df_w2 = load_items_w2()
+        _df_sh_w2 = load_shelves_w2()
+
+        # Re-check shelf FULL status at commit time (shelf may have changed since staging)
+        for _s in staged_sets:
+            for _item in _s["items"]:
+                _shelf_val = _item["Shelf"]
+                _s_stat = _df_sh_w2[_df_sh_w2["Shelf"] == _shelf_val]["Status"].values
+                if len(_s_stat) > 0 and _s_stat[0] == "FULL":
+                    messagebox.showerror("Error",
+                        f"Shelf '{_shelf_val}' is marked FULL.\n"
+                        f"Set {_s['set_id']} — {_item['Equipment Type']} cannot be placed there.\n"
+                        "Edit or remove it from staging first.")
+                    return
+
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for s in staged_sets:
             set_id = s["set_id"]
@@ -2729,6 +3358,16 @@ def w2_unstage_from_warehouse(event=None):
         messagebox.showinfo("Back to Stage", "Check at least one row in the Warehouse table.")
         return
 
+    # Single confirmation for all selected items
+    preview = []
+    for item_id in checked:
+        v = tree_w2_warehouse.item(item_id, "values")
+        if v:
+            preview.append(f"  • {v[4]} ({v[2]})  (Shelf: {v[7]})")
+    if not messagebox.askyesno("Move to Staging",
+            f"Move {len(preview)} item(s) back to staging?\n\n" + "\n".join(preview)):
+        return
+
     moved = 0
     for item_id in checked:
         values = tree_w2_warehouse.item(item_id, "values")
@@ -2736,9 +3375,6 @@ def w2_unstage_from_warehouse(event=None):
             continue
         # values: ☐(0), QR(1), Set ID(2), Hostname(3), Equipment Type(4), Serial(5), Checked By(6), Shelf(7), Status(8), Remarks(9), Date(10)
         set_id, hostname, eq_type, serial, checked_by, shelf, status, remarks = values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]
-        if not messagebox.askyesno("Move to Staging",
-            f"Move {eq_type} ({set_id}) back to staging?\n\nShelf: {shelf}"):
-            continue
 
         df_w2 = load_items_w2()
         match = df_w2[(df_w2["Set ID"] == set_id) & (df_w2["Equipment Type"] == eq_type)]
@@ -2747,7 +3383,7 @@ def w2_unstage_from_warehouse(event=None):
             continue
 
         qr_label = f"{set_id}-{eq_type}"
-        delete_qr(qr_label, warehouse=2)
+        remove_qr(qr_label, warehouse=2)
         df_w2 = df_w2.drop(match.index).reset_index(drop=True)
         save_warehouse_2(df_w2, load_shelves_w2())
 
@@ -2773,51 +3409,108 @@ def w2_unstage_from_warehouse(event=None):
         update_all_shelf_dropdowns()
 
 def w2_pull_item():
-    selection_text = w2_pull_item_entry.get().strip()
     reason = w2_pull_reason_filter_var.get().strip()
-    if not selection_text:
-        messagebox.showerror("Error", "No item selected for pull out"); return
     if not reason:
         messagebox.showerror("Error", "Please enter a pull reason"); return
 
-    # Parse "SET-001 - Monitor"
-    try:
-        set_id, eq_type = [x.strip() for x in selection_text.split(" - ", 1)]
-    except ValueError:
-        messagebox.showerror("Error", "Invalid selection format"); return
-
-    df_w2 = load_items_w2()
-    df_po2 = load_pullouts_w2()
-
-    match = df_w2[(df_w2["Set ID"] == set_id) & (df_w2["Equipment Type"] == eq_type)]
-    if match.empty:
-        messagebox.showerror("Error", f"'{selection_text}' not found in Warehouse 2"); return
-
-    if not messagebox.askyesno("Confirm Pull Out",
-        f"Pull out {eq_type} from {set_id}?\nReason: {reason}"):
+    # Collect checked rows; fall back to treeview selection; then fall back to entry text
+    checked = [iid for iid, state in w2_row_checks.items() if state]
+    if checked:
+        target_iids = checked
+    elif tree_w2_warehouse.selection():
+        target_iids = list(tree_w2_warehouse.selection())
+    else:
+        # Legacy: single item from entry text "SET-001 - Monitor"
+        selection_text = w2_pull_item_entry.get().strip()
+        if not selection_text:
+            messagebox.showerror("Error", "Select or check item(s) to pull, or select a row"); return
+        try:
+            set_id, eq_type = [x.strip() for x in selection_text.split(" - ", 1)]
+        except ValueError:
+            messagebox.showerror("Error", "Invalid selection format"); return
+        df_w2  = load_items_w2()
+        df_po2 = load_pullouts_w2()
+        match  = df_w2[(df_w2["Set ID"] == set_id) & (df_w2["Equipment Type"] == eq_type)]
+        if match.empty:
+            messagebox.showerror("Error", f"'{selection_text}' not found in Warehouse 2"); return
+        if not messagebox.askyesno("Confirm Pull Out",
+                f"Pull out {eq_type} from {set_id}?\nReason: {reason}"):
+            return
+        item_row = match.iloc[0]
+        qr_label = f"{set_id}-{eq_type}"
+        pull_qr(qr_label, warehouse=2)
+        df_w2  = df_w2.drop(match.index).reset_index(drop=True)
+        df_po2 = pd.concat([df_po2, pd.DataFrame([{
+            "QR":             str(item_row.get("QR", "")),
+            "Set ID":         set_id,
+            "Hostname":       str(item_row.get("Hostname", "")),
+            "Equipment Type": eq_type,
+            "Serial Number":  str(item_row.get("Serial Number", "")),
+            "Checked By":     str(item_row.get("Checked By", "")),
+            "Shelf":          str(item_row.get("Shelf", "")),
+            "Status":         str(item_row.get("Status", "")),
+            "Remarks":        str(item_row.get("Remarks", "")),
+            "Pull Reason":    reason,
+            "Date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }])], ignore_index=True)
+        save_warehouse_2(df_w2, load_shelves_w2(), df_po2)
+        save_log("WAREHOUSE PULL", f"[W2] Set: {set_id} | Item: {eq_type} | Reason: {reason}")
+        try:
+            all_reasons = sorted(load_pullouts_w2()["Pull Reason"].dropna().unique().tolist())
+            w2_pull_reason_filter_entry["values"] = [""] + all_reasons
+        except Exception:
+            pass
+        messagebox.showinfo("Success", f"{eq_type} from {set_id} pulled out successfully")
+        w2_pull_item_entry.delete(0, tk.END)
+        w2_pull_reason_filter_var.set("")
+        w2_refresh_all()
         return
 
-    item_row = match.iloc[0]
-    qr_label = f"{set_id}-{eq_type}"
-    delete_qr(qr_label, warehouse=2)
+    # ── Bulk pull from checked/selected rows ──────────────────
+    # W2 tree values: ☐(0), QR(1), Set ID(2), Hostname(3), Equip Type(4), Serial(5), Checked By(6), Shelf(7), Status(8), Remarks(9), Date(10)
+    targets = [(tree_w2_warehouse.item(iid, "values")[2],
+                tree_w2_warehouse.item(iid, "values")[4]) for iid in target_iids]
 
-    df_w2 = df_w2.drop(match.index).reset_index(drop=True)
-    df_po2 = pd.concat([df_po2, pd.DataFrame([{
-        "Set ID": set_id,
-        "Hostname": str(item_row.get("Hostname", "")),
-        "Equipment Type": eq_type,
-        "Serial Number": str(item_row.get("Serial Number", "")),
-        "Checked By": str(item_row.get("Checked By", "")),
-        "Shelf": str(item_row.get("Shelf", "")),
-        "Status": str(item_row.get("Status", "")),
-        "Remarks": str(item_row.get("Remarks", "")),
-        "Pull Reason": reason,
-        "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }])], ignore_index=True)
+    if not messagebox.askyesno("Confirm Pull Out",
+            f"Pull out {len(targets)} item(s)?\n" +
+            "\n".join(f"{eq} ({sid})" for sid, eq in targets) +
+            f"\n\nReason: {reason}"):
+        return
+
+    df_w2  = load_items_w2()
+    df_po2 = load_pullouts_w2()
+    pulled = 0
+    for set_id, eq_type in targets:
+        match = df_w2[(df_w2["Set ID"] == set_id) & (df_w2["Equipment Type"] == eq_type)]
+        if match.empty:
+            continue
+        item_row = match.iloc[0]
+        qr_label = f"{set_id}-{eq_type}"
+        pull_qr(qr_label, warehouse=2)
+        df_w2  = df_w2.drop(match.index).reset_index(drop=True)
+        df_po2 = pd.concat([df_po2, pd.DataFrame([{
+            "QR":             str(item_row.get("QR", "")),
+            "Set ID":         set_id,
+            "Hostname":       str(item_row.get("Hostname", "")),
+            "Equipment Type": eq_type,
+            "Serial Number":  str(item_row.get("Serial Number", "")),
+            "Checked By":     str(item_row.get("Checked By", "")),
+            "Shelf":          str(item_row.get("Shelf", "")),
+            "Status":         str(item_row.get("Status", "")),
+            "Remarks":        str(item_row.get("Remarks", "")),
+            "Pull Reason":    reason,
+            "Date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }])], ignore_index=True)
+        save_log("WAREHOUSE PULL", f"[W2] Set: {set_id} | Item: {eq_type} | Reason: {reason}")
+        pulled += 1
 
     save_warehouse_2(df_w2, load_shelves_w2(), df_po2)
-    save_log("WAREHOUSE PULL", f"[W2] Set: {set_id} | Item: {eq_type} | Reason: {reason}")
-    messagebox.showinfo("Success", f"{eq_type} from {set_id} pulled out successfully")
+    try:
+        all_reasons = sorted(load_pullouts_w2()["Pull Reason"].dropna().unique().tolist())
+        w2_pull_reason_filter_entry["values"] = [""] + all_reasons
+    except Exception:
+        pass
+    messagebox.showinfo("Success", f"{pulled} item(s) pulled out successfully")
     w2_pull_item_entry.delete(0, tk.END)
     w2_pull_reason_filter_var.set("")
     w2_refresh_all()
@@ -2833,6 +3526,30 @@ def w2_undo_pull(event=None):
         messagebox.showinfo("Back to Warehouse", "Check at least one row in the Pull History table.")
         return
 
+    # Single confirmation for all selected items
+    preview = []
+    for item_id in checked:
+        v = tree_w2_pullouts.item(item_id, "values")
+        if v:
+            preview.append(f"  • {v[3]} — {v[4]}  (Shelf: {v[5]})")
+    if not messagebox.askyesno("Undo Pull",
+            f"Restore {len(preview)} item(s) back to Warehouse 2?\n\n" + "\n".join(preview)):
+        return
+
+    # ── Pre-validate: block entire restore if any target shelf is FULL ──
+    _df_sh_w2_chk = load_shelves_w2()
+    for item_id in checked:
+        _v = tree_w2_pullouts.item(item_id, "values")
+        if not _v:
+            continue
+        _shelf = _v[5]
+        _s_stat = _df_sh_w2_chk[_df_sh_w2_chk["Shelf"] == _shelf]["Status"].values
+        if len(_s_stat) > 0 and _s_stat[0] == "FULL":
+            messagebox.showerror("Shelf Full",
+                f"Cannot restore — shelf '{_shelf}' is marked FULL.\n"
+                "Set it to AVAILABLE first, then retry.")
+            return
+
     restored = 0
     for item_id in checked:
         values = tree_w2_pullouts.item(item_id, "values")
@@ -2840,9 +3557,6 @@ def w2_undo_pull(event=None):
             continue
         # values: ☐(0), Set ID(1), Hostname(2), Equip Type(3), Serial(4), Shelf(5), Status(6), Remarks(7), PullReason(8), Date(9)
         set_id, hostname, eq_type, shelf, status, remarks = values[1], values[2], values[3], values[5], values[6], values[7]
-        if not messagebox.askyesno("Undo Pull",
-            f"Restore {eq_type} ({set_id}) back to Warehouse 2?\nShelf: {shelf}"):
-            continue
 
         df_w2 = load_items_w2()
         df_po2 = load_pullouts_w2()
@@ -2854,11 +3568,25 @@ def w2_undo_pull(event=None):
 
         pull_row = match.iloc[0]
         qr_label = f"{set_id}-{eq_type}"
-        qr_code = str(uuid.uuid4())
-        try:
-            generate_qr(qr_label, qr_code, warehouse=2)
-        except Exception as e:
-            messagebox.showwarning("Warning", f"QR not regenerated: {e}")
+
+        # ── Restore QR: move back from pull_qrs/ instead of regenerating ──
+        import shutil
+        pull_qr_file = pull_qr_path_for(qr_label, warehouse=2)
+        wh_qr_file   = qr_path_for(qr_label, warehouse=2)
+        qr_code = str(pull_row.get("QR", ""))
+        if os.path.exists(pull_qr_file):
+            try:
+                os.makedirs(QR_FOLDER_W2, exist_ok=True)
+                shutil.move(pull_qr_file, wh_qr_file)
+            except Exception as e:
+                messagebox.showwarning("Warning", f"QR file could not be moved back: {e}")
+        elif not os.path.exists(wh_qr_file):
+            # Fallback: regenerate only if truly missing from both locations
+            try:
+                qr_code = str(uuid.uuid4())
+                generate_qr(qr_label, qr_code, warehouse=2)
+            except Exception as e:
+                messagebox.showwarning("Warning", f"QR not regenerated: {e}")
 
         df_w2 = pd.concat([df_w2, pd.DataFrame([{
             "QR":             qr_code,
@@ -3213,6 +3941,11 @@ def generate_qr_pdf(items_batch, custom_name=None):
                 sidecar = json.load(kf)
             existing_items = sidecar.get("items", [])
             existing_keys  = set(sidecar.get("keys",  []))
+            # Ensure _warehouse is always present on re-loaded sidecar items
+            # so they render with the correct label layout (W1 vs W2)
+            _wh_tag = 2 if is_w2_batch else 1
+            for _it in existing_items:
+                _it.setdefault("_warehouse", _wh_tag)
         except Exception:
             existing_items = []
             existing_keys  = set()
@@ -3468,29 +4201,36 @@ def open_label_manager(warehouse=None):
     def clear_selected():
         chosen = [rd for rd in row_data if rd[6].get()]
         if not chosen:
-            messagebox.showwarning("Warning", "Check at least one file to clear.", parent=manager); return
+            messagebox.showwarning("Warning", "Check at least one file to move to dump.", parent=manager); return
         count = len(chosen)
-        prompt = (f"Delete '{chosen[0][3]}'?" if count == 1
-                  else f"Delete {count} checked file(s)?\nThis cannot be undone.")
-        if not messagebox.askyesno("Confirm Clear", prompt, parent=manager):
+        prompt = (f"Move '{chosen[0][3]}' to dump?" if count == 1
+                  else f"Move {count} checked file(s) to dump?\nThey can be recovered from the dump folder.")
+        if not messagebox.askyesno("Confirm Move to Dump", prompt, parent=manager):
             return
+        import shutil, stat
+        dump_folder = DUMP_LABELS_W1 if warehouse == 1 else DUMP_LABELS_W2
+        os.makedirs(dump_folder, exist_ok=True)
         failed = []
-        import stat
         for _, full_path, _, fname, _, _, _ in chosen:
             try:
                 if os.path.exists(full_path):
                     os.chmod(full_path, stat.S_IWRITE | stat.S_IREAD)
-                    os.remove(full_path)
+                    dest = os.path.join(dump_folder, fname)
+                    if os.path.exists(dest):
+                        base, ext = os.path.splitext(fname)
+                        dest = os.path.join(dump_folder,
+                                            f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+                    shutil.move(full_path, dest)
                     sidecar = full_path + ".keys.json"
                     if os.path.exists(sidecar):
-                        os.remove(sidecar)
+                        shutil.move(sidecar, dest + ".keys.json")
             except Exception as e:
                 failed.append(f"{fname}: {e}")
         load_label_files()
         if failed:
-            messagebox.showerror("Error", "Some files could not be deleted:\n" + "\n".join(failed), parent=manager)
+            messagebox.showerror("Error", "Some files could not be moved:\n" + "\n".join(failed), parent=manager)
         else:
-            messagebox.showinfo("Cleared", f"{count} file(s) deleted.", parent=manager)
+            messagebox.showinfo("Moved to Dump", f"{count} file(s) moved to dump folder.", parent=manager)
 
     # ── Bottom toolbar ───────────────────────────────────────
     btn_frame_m = tk.Frame(manager)
@@ -3519,6 +4259,12 @@ def open_activity_log():
     )
     filter_action_cb.pack(side="left", padx=(0, 10))
 
+    log_date_from_var = tk.StringVar()
+    log_date_to_var   = tk.StringVar()
+    _date_picker_widget(filter_frame, log_date_from_var, "From:").pack(side="left", padx=(5, 4))
+    _date_picker_widget(filter_frame, log_date_to_var,   "To:").pack(side="left", padx=(0, 6))
+    tk.Button(filter_frame, text="↻", command=lambda: reset_filters(), width=3).pack(side="left", padx=(0, 10))
+
     count_label = tk.Label(filter_frame, text="", fg="blue")
     count_label.pack(side="right", padx=10)
 
@@ -3537,7 +4283,6 @@ def open_activity_log():
 
     btn_frame = tk.Frame(user_panel)
     btn_frame.pack(pady=(5, 0))
-    tk.Button(btn_frame, text="↻", command=lambda: reset_filters(), width=3).pack(padx=2)
 
     table_frame_l = tk.Frame(content_frame)
     table_frame_l.pack(side="left", fill="both", expand=True)
@@ -3577,10 +4322,13 @@ def open_activity_log():
     def load_log_data():
         tree_log.delete(*tree_log.get_children())
         df_log = load_logs()
-        action_f = filter_action_var.get().strip()
-        user_f = get_selected_user()
+        action_f  = filter_action_var.get().strip()
+        user_f    = get_selected_user()
+        date_from = log_date_from_var.get().strip()
+        date_to   = log_date_to_var.get().strip()
         if user_f:   df_log = df_log[df_log["User"] == user_f]
         if action_f: df_log = df_log[df_log["Action"] == action_f]
+        df_log = _filter_by_date(df_log, date_from, date_to, col="Timestamp")
         df_log = df_log.iloc[::-1].reset_index(drop=True)
         for _, row in df_log.iterrows():
             tree_log.insert("", "end", values=tuple(
@@ -3589,12 +4337,16 @@ def open_activity_log():
 
     def reset_filters():
         filter_action_var.set("")
+        log_date_from_var.set("")
+        log_date_to_var.set("")
         user_listbox.selection_clear(0, tk.END)
         user_listbox.selection_set(0)
         load_log_data()
 
     filter_action_cb.bind("<<ComboboxSelected>>", lambda e: load_log_data())
     user_listbox.bind("<<ListboxSelect>>", lambda e: load_log_data())
+    log_date_from_var.trace_add("write", lambda *_: load_log_data())
+    log_date_to_var.trace_add("write", lambda *_: load_log_data())
     populate_user_listbox()
     load_log_data()
 
@@ -4515,6 +5267,18 @@ update_staged_display()
 update_w2_staged_display()
 show_warehouse()
 w2_show_warehouse()
+
+# Pre-load pull reason dropdowns from saved history
+try:
+    all_reasons_w1 = sorted(load_pullouts()["Pull Reason"].dropna().unique().tolist())
+    pull_reason_filter_entry["values"] = [""] + all_reasons_w1
+except Exception:
+    pass
+try:
+    all_reasons_w2 = sorted(load_pullouts_w2()["Pull Reason"].dropna().unique().tolist())
+    w2_pull_reason_filter_entry["values"] = [""] + all_reasons_w2
+except Exception:
+    pass
 
 # Attach click-to-sort on all main treeviews
 for _t in (tree_warehouse, tree_available, tree_pullouts, tree_qr,
