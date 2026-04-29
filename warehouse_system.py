@@ -16,7 +16,8 @@ else:
     # Running as a normal Python script
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE = os.path.join(BASE_DIR, "warehouse.xlsx")
-LOG_FILE = os.path.join(BASE_DIR, "activity_log.xlsx")
+LOG_FILE = FILE  # Logs stored inside warehouse.xlsx as a very hidden sheet
+LOG_SHEET = "activity_logs"
 USERS_FILE = os.path.join(BASE_DIR, "users.xlsx")
 QR_FOLDER = os.path.join(BASE_DIR, "qr_codes")
 QR_FOLDER_W1 = os.path.join(QR_FOLDER, "warehouse_1")
@@ -162,12 +163,19 @@ def initialize_file():
         messagebox.showerror("File Error", f"Could not create '{FILE}':\n{e}\n\nMake sure the file is not open in Excel.")
 
 def initialize_log():
-    if not os.path.exists(LOG_FILE):
-        with pd.ExcelWriter(LOG_FILE, engine='openpyxl') as writer:
-            pd.DataFrame(columns=["Timestamp", "User", "Action", "Details"]).to_excel(writer, sheet_name="logs", index=False)
-            for ws in writer.book.worksheets:
-                ws.protection.sheet = True
-                ws.protection.enable()
+    from openpyxl import load_workbook
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    try:
+        wb = load_workbook(FILE)
+        if LOG_SHEET not in wb.sheetnames:
+            ws = wb.create_sheet(LOG_SHEET)
+            ws.append(["Timestamp", "User", "Action", "Details"])
+            ws.sheet_state = "veryHidden"
+            ws.protection.sheet = True
+            ws.protection.enable()
+            wb.save(FILE)
+    except Exception:
+        pass
 
 # ========== USERS DATABASE ==========
 
@@ -338,7 +346,24 @@ def load_items_w2():
             df[col] = pd.Series(dtype=str)
     return df
 def load_pullouts_w2(): return _load_sheet(FILE, "pullouts_w2", initialize_file)
-def load_logs():        return _load_sheet(LOG_FILE, "logs", initialize_log)
+def load_logs():
+    from openpyxl import load_workbook
+    try:
+        initialize_log()
+        wb = load_workbook(FILE, data_only=True)
+        if LOG_SHEET not in wb.sheetnames:
+            return pd.DataFrame(columns=["Timestamp", "User", "Action", "Details"])
+        ws = wb[LOG_SHEET]
+        ws.sheet_state = "visible"
+        ws.protection.sheet = False
+        data = [row for row in ws.iter_rows(values_only=True) if any(cell is not None for cell in row)]
+        if not data:
+            return pd.DataFrame(columns=["Timestamp", "User", "Action", "Details"])
+        headers = data[0]
+        rows = data[1:]
+        return pd.DataFrame(rows, columns=list(headers))
+    except Exception as e:
+        return pd.DataFrame(columns=["Timestamp", "User", "Action", "Details"])
 
 def _excel_locked_error():
     messagebox.showerror(
@@ -349,7 +374,24 @@ def _excel_locked_error():
 
 def _write_all_sheets(df_items, df_shelves, df_pullouts, df_items_w2, df_shelves_w2, df_po2):
     """Single write point for the warehouse Excel file. Raises on failure."""
+    from openpyxl import load_workbook
     try:
+        # Preserve the activity_logs sheet before overwriting
+        existing_log_ws = None
+        if os.path.exists(FILE):
+            try:
+                wb_old = load_workbook(FILE)
+                if LOG_SHEET in wb_old.sheetnames:
+                    existing_log_ws = wb_old[LOG_SHEET]
+                    existing_log_ws.protection.sheet = False
+                    log_data = list(existing_log_ws.values)
+                else:
+                    log_data = [("Timestamp", "User", "Action", "Details")]
+            except Exception:
+                log_data = [("Timestamp", "User", "Action", "Details")]
+        else:
+            log_data = [("Timestamp", "User", "Action", "Details")]
+
         with pd.ExcelWriter(FILE, engine='openpyxl') as writer:
             df_items.to_excel(writer,     sheet_name="items",       index=False)
             df_shelves.to_excel(writer,   sheet_name="shelves",     index=False)
@@ -360,6 +402,13 @@ def _write_all_sheets(df_items, df_shelves, df_pullouts, df_items_w2, df_shelves
             for ws in writer.book.worksheets:
                 ws.protection.sheet = True
                 ws.protection.enable()
+            # Re-add the log sheet as veryHidden
+            log_ws = writer.book.create_sheet(LOG_SHEET)
+            for row in log_data:
+                log_ws.append(list(row))
+            log_ws.sheet_state = "veryHidden"
+            log_ws.protection.sheet = True
+            log_ws.protection.enable()
     except PermissionError:
         _excel_locked_error()
         raise
@@ -376,16 +425,37 @@ def save_warehouse_2(df_items_w2, df_shelves_w2, df_pullouts_w2=None):
     _write_all_sheets(load_items(), load_shelves(), load_pullouts(),
                       df_items_w2, df_shelves_w2, df_pullouts_w2)
 
+def _unhide_file(path):
+    """Remove the hidden attribute on Windows so it can be written to."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), 1)  # FILE_ATTRIBUTE_NORMAL
+    except Exception:
+        pass
+
 def save_log(action, details=""):
-    initialize_log()
-    df_log = load_logs()
-    new_row = {"Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "User": current_user, "Action": action, "Details": details}
-    df_log = pd.concat([df_log, pd.DataFrame([new_row])], ignore_index=True)
-    with pd.ExcelWriter(LOG_FILE, engine='openpyxl') as writer:
-        df_log.to_excel(writer, sheet_name="logs", index=False)
-        for ws in writer.book.worksheets:
-            ws.protection.sheet = True
-            ws.protection.enable()
+    from openpyxl import load_workbook
+    try:
+        initialize_log()
+        wb = load_workbook(FILE)
+        if LOG_SHEET not in wb.sheetnames:
+            ws = wb.create_sheet(LOG_SHEET)
+            ws.append(["Timestamp", "User", "Action", "Details"])
+        else:
+            ws = wb[LOG_SHEET]
+            ws.protection.sheet = False
+        ws.sheet_state = "veryHidden"
+        ws.append([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            current_user,
+            action,
+            details
+        ])
+        ws.protection.sheet = True
+        ws.protection.enable()
+        wb.save(FILE)
+    except Exception:
+        pass
 
 # ========== QR HELPERS ==========
 
@@ -608,8 +678,9 @@ def _clear_input_fields():
 
 def remove_from_staging():
     global selected_staged_index
-    if selected_staged_index is not None:
-        index = selected_staged_index
+    sel = staged_listbox.curselection()
+    if sel:
+        index = sel[0]
         if index >= len(staged_items):
             messagebox.showerror("Error", "Invalid staged selection")
             selected_staged_index = None
@@ -617,6 +688,7 @@ def remove_from_staging():
         removed = staged_items.pop(index)
         selected_staged_index = None
         _clear_input_fields()
+        update_staged_display()
         messagebox.showinfo("Removed", f"'{removed['Hostname']}' removed from staging")
     else:
         if not staged_items:
@@ -627,8 +699,8 @@ def remove_from_staging():
         staged_items.clear()
         selected_staged_index = None
         _clear_input_fields()
+        update_staged_display()
         messagebox.showinfo("Cleared", "All staged items cleared")
-    update_staged_display()
 
 def put_item():
     hostname   = hostname_entry.get().strip()
@@ -2220,8 +2292,8 @@ def view_excel(warehouse=None):
         hdr_row = tk.Frame(inner_cl, bg="#dce3f0")
         hdr_row.pack(fill="x")
         tk.Label(hdr_row, text="✔", width=3, bg="#dce3f0", font=("Helvetica", 9, "bold")).pack(side="left", padx=(6,0))
-        for txt, w in [("Warehouse", 110), ("Type", 100), ("Filename", 200), ("Created", 155), ("Size", 60)]:
-            tk.Label(hdr_row, text=txt, width=w//7, bg="#dce3f0",
+        for txt, w in [("Warehouse", 14), ("Type", 12), ("Filename", 24), ("Created", 22), ("Size", 10)]:
+            tk.Label(hdr_row, text=txt, width=w, bg="#dce3f0",
                      font=("Helvetica", 9, "bold"), anchor="w").pack(side="left", padx=4, pady=5)
 
         idx = 0
@@ -2268,7 +2340,10 @@ def view_excel(warehouse=None):
                     cb = tk.Checkbutton(row_fr, variable=var, bg=bg,
                                         command=lambda: [_refresh_sel_count(), _repaint_rows()])
                     cb.pack(side="left", padx=(6, 0), pady=4)
-                    for txt, w in [(warehouse_label, 16), (folder_type, 14), (f, 28), (date_str, 22), (f"{size_kb} kb", 8)]:
+                    size_str = f"{size_kb} KB" if size_kb < 1024 else f"{round(size_kb/1024, 2)} MB"
+                    size_str = f"{size_kb} KB" if size_kb < 1024 else f"{round(size_kb / 1024, 2)} MB"
+                    size_str = f"{size_kb} KB" if size_kb < 1024 else f"{round(size_kb / 1024, 2)} MB"
+                    for txt, w in [(warehouse_label, 14), (folder_type, 12), (f, 24), (date_str, 22), (size_str, 10)]:
                         lbl = tk.Label(row_fr, text=txt, bg=bg, anchor="w", width=w,
                                        font=("Helvetica", 9))
                         lbl.pack(side="left", padx=4, pady=4)
@@ -2971,7 +3046,15 @@ def w2_build_set():
 def w2_remove_staged_set():
     global selected_set_index
     sel = w2_staged_listbox.curselection()
-    if not sel:
+    if sel:
+        index = sel[0]
+        if index >= len(staged_sets):
+            return
+        removed = staged_sets.pop(index)
+        selected_set_index = None
+        update_w2_staged_display()
+        messagebox.showinfo("Removed", f"{removed['set_id']} removed from staging")
+    else:
         if not staged_sets:
             messagebox.showinfo("Info", "No staged sets to clear"); return
         if not messagebox.askyesno("Confirm", f"Clear all {len(staged_sets)} staged set(s)?"):
@@ -2980,14 +3063,6 @@ def w2_remove_staged_set():
         selected_set_index = None
         update_w2_staged_display()
         messagebox.showinfo("Cleared", "All staged sets cleared")
-        return
-    index = sel[0]
-    if index >= len(staged_sets):
-        return
-    removed = staged_sets.pop(index)
-    selected_set_index = None
-    update_w2_staged_display()
-    messagebox.showinfo("Removed", f"{removed['set_id']} removed from staging")
 
 def w2_put_warehouse():
     if not staged_sets:
@@ -4061,8 +4136,8 @@ def generate_qr_pdf(items_batch, custom_name=None):
 def open_label_manager(warehouse=None):
     manager = tk.Toplevel(root)
     manager.title(f"QR Label Manager — Warehouse {warehouse}" if warehouse else "QR Label Manager")
-    manager.geometry("700x500")
-    manager.resizable(False, False)
+    manager.geometry("950x500")
+    manager.resizable(True, False)
 
     # ── Header ──────────────────────────────────────────────
     hdr = tk.Frame(manager, bg="#2c3e50")
@@ -4168,7 +4243,8 @@ def open_label_manager(warehouse=None):
                 cb = tk.Checkbutton(row_fr, variable=var, bg=bg,
                                     command=lambda: [_refresh_sel_count(), _repaint_rows()])
                 cb.pack(side="left", padx=(6, 0), pady=4)
-                for txt, w in [(warehouse_label, 16), (f, 34), (date_str, 22), (f"{size_kb} kb", 8)]:
+                size_str = f"{size_kb} KB" if size_kb < 1024 else f"{round(size_kb/1024, 2)} MB"
+                for txt, w in [(warehouse_label, 16), (f, 34), (date_str, 22), (size_str, 10)]:
                     lbl = tk.Label(row_fr, text=txt, bg=bg, anchor="w", width=w,
                                    font=("Helvetica", 9))
                     lbl.pack(side="left", padx=4, pady=4)
