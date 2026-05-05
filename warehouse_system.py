@@ -1,12 +1,18 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import pandas as pd
 import os
 import uuid
 import qrcode
 import re
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+_PST = timezone(timedelta(hours=8))   # Philippine Standard Time (UTC+8)
+def _now():
+    """Return the current datetime in Philippine Standard Time."""
+    return datetime.now(_PST).replace(tzinfo=None)
+
 import sys
 
 if getattr(sys, 'frozen', False):
@@ -222,7 +228,7 @@ def initialize_users():
             "Username": "admin",
             "Password": _hash_password(default_pw),
             "Role":     "admin",
-            "Created":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Created":  _now().strftime("%Y-%m-%d %H:%M:%S"),
         }])
         with pd.ExcelWriter(USERS_FILE, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="users", index=False)
@@ -288,7 +294,7 @@ def create_account(username: str, password: str) -> str:
         "Username": username,
         "Password": _hash_password(password),
         "Role":     role,
-        "Created":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Created":  _now().strftime("%Y-%m-%d %H:%M:%S"),
     }])
     df = pd.concat([df, new_row], ignore_index=True)
     _save_users(df)
@@ -527,7 +533,7 @@ def save_log(action, details=""):
             ws.protection.sheet = False
         ws.sheet_state = "veryHidden"
         ws.append([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            _now().strftime("%Y-%m-%d %H:%M:%S"),
             current_user,
             action,
             details
@@ -569,7 +575,7 @@ def delete_qr(hostname, warehouse=1):
             if os.path.exists(dest):
                 base, ext = os.path.splitext(os.path.basename(path))
                 dest = os.path.join(dump_qr_folder,
-                                    f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+                                    f"{base}_{_now().strftime('%Y%m%d%H%M%S')}{ext}")
             shutil.move(path, dest)
         except Exception as e:
             messagebox.showwarning("Warning", f"QR file not moved to dump: {e}")
@@ -618,14 +624,15 @@ def delete_pull_qr(hostname, warehouse=1):
 
 def pick_date(parent, target_var, title="Select Date"):
     """Pop up a simple month calendar; sets target_var to 'YYYY-MM-DD' on pick."""
-    from calendar import monthcalendar
+    from calendar import monthcalendar, setfirstweekday, SUNDAY
+    setfirstweekday(SUNDAY)
     cal_win = tk.Toplevel(parent)
     cal_win.title(title)
     cal_win.resizable(False, False)
     cal_win.transient(parent)
     cal_win.grab_set()
 
-    today = datetime.today()
+    today = _now()
     # mutable state inside closure
     state = {"year": today.year, "month": today.month}
 
@@ -918,7 +925,7 @@ def put_warehouse():
                     "Edit or remove it from staging first.")
                 return
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _now().strftime("%Y-%m-%d %H:%M:%S")
         for item in staged_items:
             qr_code = str(uuid.uuid4())
             generate_qr(item['Hostname'], item['Hostname'], warehouse=1)
@@ -1027,7 +1034,7 @@ def delete_item():
             else:
                 df_dump = pd.DataFrame()
             row_copy = row.copy()
-            row_copy["Dumped At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            row_copy["Dumped At"] = _now().strftime("%Y-%m-%d %H:%M:%S")
             df_dump = pd.concat([df_dump, row_copy], ignore_index=True)
             with pd.ExcelWriter(dump_file, engine="openpyxl",
                                 mode="a" if os.path.exists(dump_file) else "w",
@@ -1153,7 +1160,7 @@ def pull_item():
             "Status":        str(item_row.get("Status", "")),
             "Remarks":       str(item_row.get("Remarks", "")),
             "Pull Reason":   reason,
-            "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":          _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
         save_warehouse_1(df_items, df_shelves, df_pullouts)
         save_log("WAREHOUSE PULL", f"[W1] Hostname: {hostname} | Shelf: {shelf} | Reason: {reason}")
@@ -1196,7 +1203,7 @@ def pull_item():
             "Status":        str(item_row.get("Status", "")),
             "Remarks":       str(item_row.get("Remarks", "")),
             "Pull Reason":   reason,
-            "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":          _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
         save_log("WAREHOUSE PULL", f"[W1] Hostname: {hostname} | Shelf: {shelf} | Reason: {reason}")
         pulled += 1
@@ -1300,7 +1307,7 @@ def undo_pull(event=None):
             "Shelf": shelf,
             "Status": status,
             "Remarks": remarks,
-            "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date": _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
 
         df_pullouts = df_pullouts[df_pullouts["Hostname"] != hostname].reset_index(drop=True)
@@ -1403,7 +1410,7 @@ def set_shelf_status(new_status):
     if len(idx) == 0:
         return
     df_shelves.at[idx[0], "Status"] = new_status
-    df_shelves.at[idx[0], "Date_Full"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if new_status == "FULL" else None
+    df_shelves.at[idx[0], "Date_Full"] = _now().strftime("%Y-%m-%d %H:%M:%S") if new_status == "FULL" else None
     save_warehouse_1(df_items, df_shelves)
     save_log("SHELF STATUS", f"[W1] Shelf: {shelf} → {new_status}")
     w1_status_label.config(text=f"{shelf} → {new_status}")
@@ -1501,8 +1508,7 @@ def _open_qr_gallery(warehouse, filter_keys=None):
                 kw_fields = [set_id, eq_type, shelf]
                 cell_labels = [(key, ("Helvetica", 8, "bold"), "#2c3e50", 0),
                                (host, ("Helvetica", 7, "italic"), "#2c3e50", 0),
-                               (f"S/N: {sub}", ("Helvetica", 7), "#555", 0),
-                               (f"Shelf: {shelf}", ("Helvetica", 7), "gray", 0)]
+                               (f"S/N: {sub}", ("Helvetica", 7), "#555", 0)]
 
             # Filter by selection keys (from Stored QR button) first,
             # then by the gallery's own search box
@@ -1859,7 +1865,7 @@ def generate_stored_qr(warehouse=1):
                 for values in rows:
                     if warehouse == 1:
                         key = str(values[2])
-                        label = f"  • {values[2]}  (Serial: {values[3]})"
+                        label = f"  • {values[2]}"
                     else:
                         key   = f"{values[2]}-{values[4]}"
                         label = f"  • {values[2]} — {values[4]}  (Serial: {values[5]})"
@@ -1884,15 +1890,15 @@ def generate_stored_qr(warehouse=1):
                     ws_chk = wb_chk[sheet_name_str]
                     existing_xl_keys = set()
                     for xl_row in ws_chk.iter_rows(min_row=2, values_only=True):
-                        if xl_row and xl_row[1] is not None:
+                        if xl_row and xl_row[0] is not None:
                             if warehouse == 1:
-                                existing_xl_keys.add((str(xl_row[1]), str(xl_row[2])))
+                                existing_xl_keys.add(str(xl_row[0]))
                             else:
                                 existing_xl_keys.add((str(xl_row[1]), str(xl_row[3]), str(xl_row[4])))
                     for values in rows:
                         if warehouse == 1:
-                            key   = (str(values[2]), str(values[3]))
-                            label = f"  • {values[2]}  (Serial: {values[3]})"
+                            key   = str(values[2])
+                            label = f"  • {values[2]}"
                         else:
                             key   = (str(values[2]), str(values[4]), str(values[5]))
                             label = f"  • {values[2]} — {values[4]}  (Serial: {values[5]})"
@@ -1995,7 +2001,7 @@ def generate_stored_qr(warehouse=1):
                         for values in rows
                     ]
 
-                gen_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                gen_at = _now().strftime("%Y-%m-%d %H:%M:%S")
                 header = cols_xl
 
                 # ── Lift read-only if file exists ─────────────────────
@@ -2138,7 +2144,7 @@ def _export_pull_history(warehouse=1):
 
     records   = [{c: values[i] for c, i in zip(cols, col_indices)} for values in rows]
     df_export = pd.DataFrame(records, columns=cols)
-    df_export.insert(0, "Exported At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    df_export.insert(0, "Exported At", _now().strftime("%Y-%m-%d %H:%M:%S"))
 
     # Scan pull_excel folder for existing files to populate dropdown
     os.makedirs(pull_xl_folder, exist_ok=True)
@@ -2328,7 +2334,7 @@ def _export_pull_history(warehouse=1):
             return
 
         df_new = pd.DataFrame(new_records, columns=cols)
-        df_new.insert(0, "Exported At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        df_new.insert(0, "Exported At", _now().strftime("%Y-%m-%d %H:%M:%S"))
 
         if os.path.exists(out_path):
             wb = load_workbook(out_path)
@@ -2442,7 +2448,7 @@ def view_excel(warehouse=None):
         row_data.clear()
         check_vars.clear()
 
-        now = datetime.now()
+        now = _now()
         all_warehouses = [("Warehouse 1", 1), ("Warehouse 2", 2)]
         filtered = [(wl, wn) for wl, wn in all_warehouses if warehouse is None or wn == warehouse]
 
@@ -2562,7 +2568,7 @@ def view_excel(warehouse=None):
                     if os.path.exists(dest):
                         base, ext = os.path.splitext(fname)
                         dest = os.path.join(dump_folder,
-                                            f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+                                            f"{base}_{_now().strftime('%Y%m%d%H%M%S')}{ext}")
                     shutil.move(full_path, dest)
                     save_log("FILE DELETED", f"File: {fname} | Warehouse: {warehouse_label} | Moved to dump: {dest}")
             except Exception as e:
@@ -3345,7 +3351,7 @@ def w2_put_warehouse():
                         "Edit or remove it from staging first.")
                     return
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _now().strftime("%Y-%m-%d %H:%M:%S")
         for s in staged_sets:
             set_id = s["set_id"]
             for item in s["items"]:
@@ -3768,7 +3774,7 @@ def w2_pull_item():
             "Status":         str(item_row.get("Status", "")),
             "Remarks":        str(item_row.get("Remarks", "")),
             "Pull Reason":    reason,
-            "Date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":           _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
         save_warehouse_2(df_w2, load_shelves_w2(), df_po2)
         save_log("WAREHOUSE PULL", f"[W2] Set: {set_id} | Item: {eq_type} | Reason: {reason}")
@@ -3817,7 +3823,7 @@ def w2_pull_item():
             "Status":         str(item_row.get("Status", "")),
             "Remarks":        str(item_row.get("Remarks", "")),
             "Pull Reason":    reason,
-            "Date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":           _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
         save_log("WAREHOUSE PULL", f"[W2] Set: {set_id} | Item: {eq_type} | Reason: {reason}")
         pulled += 1
@@ -3916,7 +3922,7 @@ def w2_undo_pull(event=None):
             "Shelf":          shelf,
             "Status":         status,
             "Remarks":        remarks,
-            "Date":           datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":           _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
 
         df_po2 = df_po2.drop(match.index).reset_index(drop=True)
@@ -4079,7 +4085,7 @@ def w2_set_shelf_status(new_status):
     if len(idx) == 0:
         return
     df_shelves_w2.at[idx[0], "Status"] = new_status
-    df_shelves_w2.at[idx[0], "Date_Full"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if new_status == "FULL" else None
+    df_shelves_w2.at[idx[0], "Date_Full"] = _now().strftime("%Y-%m-%d %H:%M:%S") if new_status == "FULL" else None
     save_warehouse_2(df_items_w2, df_shelves_w2)
     save_log("SHELF STATUS", f"[W2] Shelf: {shelf} → {new_status}")
     w2_status_label.config(text=f"{shelf} → {new_status}")
@@ -4372,7 +4378,7 @@ def yk_put_warehouse():
                         f"Item '{_item['Hostname']}' cannot be placed there.\n"
                         "Edit or remove it from staging first.")
                     return
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _now().strftime("%Y-%m-%d %H:%M:%S")
         for item in staged_yk_items:
             qr_code = str(uuid.uuid4())
             generate_qr(item["Hostname"], item["Hostname"], warehouse=3)
@@ -4422,7 +4428,7 @@ def yk_delete_item():
             else:
                 df_dump = pd.DataFrame()
             row_copy = row.copy()
-            row_copy["Dumped At"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            row_copy["Dumped At"] = _now().strftime("%Y-%m-%d %H:%M:%S")
             df_dump = pd.concat([df_dump, row_copy], ignore_index=True)
             with pd.ExcelWriter(dump_file, engine="openpyxl",
                                 mode="a" if os.path.exists(dump_file) else "w",
@@ -4517,7 +4523,7 @@ def yk_pull_item():
             "Status":        str(item_row.get("Status","")),
             "Remarks":       str(item_row.get("Remarks","")),
             "Pull Reason":   reason,
-            "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":          _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
         save_warehouse_yk(df_yk, None, df_po_yk)
         save_log("WAREHOUSE PULL", f"[YK] Hostname: {hostname} | Reason: {reason}")
@@ -4553,7 +4559,7 @@ def yk_pull_item():
             "Status":        str(item_row.get("Status","")),
             "Remarks":       str(item_row.get("Remarks","")),
             "Pull Reason":   reason,
-            "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":          _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
         save_log("WAREHOUSE PULL", f"[YK] Hostname: {hostname} | Reason: {reason}")
         pulled += 1
@@ -4620,7 +4626,7 @@ def yk_undo_pull(event=None):
             "Shelf":         shelf,
             "Status":        status,
             "Remarks":       remarks,
-            "Date":          datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Date":          _now().strftime("%Y-%m-%d %H:%M:%S")
         }])], ignore_index=True)
         df_po_yk = df_po_yk[df_po_yk["Hostname"] != hostname].reset_index(drop=True)
         save_warehouse_yk(df_yk, None, df_po_yk)
@@ -4887,7 +4893,7 @@ def yk_set_shelf_status(new_status):
     if len(idx) == 0:
         return
     df_shelves_yk.at[idx[0], "Status"] = new_status
-    df_shelves_yk.at[idx[0], "Date_Full"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if new_status == "FULL" else None
+    df_shelves_yk.at[idx[0], "Date_Full"] = _now().strftime("%Y-%m-%d %H:%M:%S") if new_status == "FULL" else None
     save_warehouse_yk(load_items_yk(), df_shelves_yk)
     save_log("SHELF STATUS", f"[YK] Shelf: {shelf} → {new_status}")
     yk_status_label.config(text=f"{shelf} → {new_status}")
@@ -5076,10 +5082,71 @@ def _yk_do_generate_files(rows, qr_keys):
     name_win.geometry(f"+{px+(pw-nw)//2}+{py+(ph-nh)//2}"); name_win.focus_force()
     root.wait_window(name_win)
     if not confirmed[0]: return
-    save_log("GENERATE FILES", f"[YK] {len(rows)} item(s)")
     pdf_name_str  = pdf_name_var.get().strip()
     file_name_str = file_name_var.get().strip()
     sheet_str     = sheet_name_var.get().strip()
+
+    # ── Check for already-generated items (mirrors W1/W2 behaviour) ──
+    already_in_pdf   = []
+    already_in_excel = []
+    import json
+    safe_pdf = pdf_name_str.replace(" ", "_").replace("/", "-").replace("\\", "-")
+    if not safe_pdf.lower().endswith(".pdf"): safe_pdf += ".pdf"
+    sidecar_path = os.path.join(QR_LABELS_FOLDER_YK, safe_pdf + ".keys.json")
+    if os.path.exists(sidecar_path):
+        try:
+            with open(sidecar_path, "r") as kf:
+                existing_keys = set(json.load(kf).get("keys", []))
+            for values in rows:
+                key   = str(values[2])
+                label = f"  • {values[2]}"
+                if key in existing_keys:
+                    already_in_pdf.append(label)
+        except Exception:
+            pass
+    safe_xl = file_name_str.replace("/", "-").replace("\\", "-")
+    if not safe_xl.lower().endswith(".xlsx"): safe_xl += ".xlsx"
+    excel_check_path = os.path.join(EXCEL_FOLDER_YK, safe_xl)
+    if os.path.exists(excel_check_path):
+        try:
+            from openpyxl import load_workbook as _lw
+            wb_chk = _lw(excel_check_path, data_only=True)
+            for ws_p in wb_chk.worksheets: ws_p.protection.sheet = False
+            if sheet_str in wb_chk.sheetnames:
+                ws_chk = wb_chk[sheet_str]
+                existing_xl_keys = set()
+                for xl_row in ws_chk.iter_rows(min_row=2, values_only=True):
+                    if xl_row and xl_row[0] is not None:
+                        existing_xl_keys.add((str(xl_row[0]), str(xl_row[1])))
+                for values in rows:
+                    key   = (str(values[2]), str(values[3]))
+                    label = f"  • {values[2]}"
+                    if key in existing_xl_keys:
+                        already_in_excel.append(label)
+            wb_chk.close()
+        except Exception:
+            pass
+    if already_in_pdf or already_in_excel:
+        parts = []
+        if already_in_pdf:
+            parts.append(
+                f"Already in PDF '{pdf_name_str}'  ({len(already_in_pdf)} item(s)):\n"
+                + "\n".join(already_in_pdf)
+            )
+        if already_in_excel:
+            parts.append(
+                f"Already in Excel '{file_name_str}' / sheet '{sheet_str}'  ({len(already_in_excel)} item(s)):\n"
+                + "\n".join(already_in_excel)
+            )
+        msg = (
+            "Some selected items were already generated before:\n\n"
+            + "\n\n".join(parts)
+            + "\n\nDo you want to continue? (duplicates will be skipped)"
+        )
+        if not messagebox.askyesno("Already Generated", msg):
+            return
+
+    save_log("GENERATE FILES", f"[YK] {len(rows)} item(s)")
     # PDF
     pdf_msg = ""
     if gen_pdf_var.get():
@@ -5108,7 +5175,7 @@ def _yk_do_generate_files(rows, qr_keys):
             cols_xl   = ["Hostname","Serial Number","Checked By","Shelf","Status","Remarks","Date"]
             # values: ☐(0),QR(1),Hostname(2),Serial(3),CB(4),Shelf(5),Status(6),Remarks(7),Date(8)
             records_xl = [[v[2],v[3],v[4],v[5],v[6],v[7],v[8]] for v in rows]
-            gen_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            gen_at = _now().strftime("%Y-%m-%d %H:%M:%S")
             header = cols_xl
             if os.path.exists(excel_path):
                 try:
@@ -5193,7 +5260,7 @@ def _yk_generate_qr_pdf(items_batch, custom_name=None):
         fields = [("Hostname:",   str(item.get("Hostname",""))),
                   ("Serial No:",  str(item.get("Serial Number",""))),
                   ("Checked By:", str(item.get("Checked By",""))),
-                  ("Date:",       str(item.get("_date", datetime.now().strftime("%Y-%m-%d"))))]
+                  ("Date:",       str(item.get("_date", _now().strftime("%Y-%m-%d"))))]
         path = qr_path_for(item.get("Hostname",""), warehouse=3)
         x = MARGIN_X + col*(LABEL_W+GAP_X); y = MARGIN_Y + row*(LABEL_H+GAP_Y)
         if y+LABEL_H > 210-MARGIN_Y: pdf.add_page(); col=row=0; x=MARGIN_X; y=MARGIN_Y
@@ -5206,7 +5273,7 @@ def _yk_generate_qr_pdf(items_batch, custom_name=None):
         col += 1
         if col >= COLS: col=0; row+=1
     pdf.output(pdf_path)
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now().strftime("%Y-%m-%d")
     for it in new_items: it.setdefault("_date", today)
     all_keys = list(existing_keys | {_item_key(it) for it in new_items})
     try:
@@ -5287,7 +5354,7 @@ def _yk_export_pull_history():
         import openpyxl
         from openpyxl import load_workbook
         df_new = pd.DataFrame(records, columns=cols)
-        df_new.insert(0, "Exported At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        df_new.insert(0, "Exported At", _now().strftime("%Y-%m-%d %H:%M:%S"))
         if os.path.exists(out_path):
             wb = load_workbook(out_path)
             for ws_p in wb.worksheets: ws_p.protection.sheet=False
@@ -5447,7 +5514,7 @@ def yk_open_label_manager():
             except Exception: pass
     def load_files():
         for w in inner_cl.winfo_children(): w.destroy(); row_data.clear(); check_vars.clear()
-        now = datetime.now()
+        now = _now()
         hdr_row = tk.Frame(inner_cl, bg="#dce3f0"); hdr_row.pack(fill="x")
         tk.Label(hdr_row, text="✔", width=3, bg="#dce3f0", font=("Helvetica",9,"bold")).pack(side="left", padx=(6,0))
         for txt,w in [("Type",12),("Filename",28),("Created",22),("Size",10)]:
@@ -5503,7 +5570,7 @@ def yk_open_label_manager():
                     os.chmod(fp, stat.S_IWRITE | stat.S_IREAD)
                     dest=os.path.join(dump_folder, fname)
                     if os.path.exists(dest):
-                        base,ext=os.path.splitext(fname); dest=os.path.join(dump_folder,f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+                        base,ext=os.path.splitext(fname); dest=os.path.join(dump_folder,f"{base}_{_now().strftime('%Y%m%d%H%M%S')}{ext}")
                     shutil.move(fp, dest)
             except Exception as e: failed.append(f"{fname}: {e}")
         load_files()
@@ -5538,7 +5605,7 @@ def yk_view_excel():
         _refresh_sel()
     def load_excel_files():
         for w in inner_cl.winfo_children(): w.destroy(); row_data.clear(); check_vars.clear()
-        now=datetime.now()
+        now=_now()
         hdr_row=tk.Frame(inner_cl,bg="#dce3f0"); hdr_row.pack(fill="x")
         tk.Label(hdr_row,text="✔",width=3,bg="#dce3f0",font=("Helvetica",9,"bold")).pack(side="left",padx=(6,0))
         for txt,w in [("Type",12),("Filename",24),("Created",22),("Size",10)]:
@@ -5592,7 +5659,7 @@ def yk_view_excel():
                     os.chmod(fp,stat.S_IWRITE|stat.S_IREAD)
                     dest=os.path.join(dump_folder,fname)
                     if os.path.exists(dest):
-                        base,ext=os.path.splitext(fname); dest=os.path.join(dump_folder,f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+                        base,ext=os.path.splitext(fname); dest=os.path.join(dump_folder,f"{base}_{_now().strftime('%Y%m%d%H%M%S')}{ext}")
                     shutil.move(fp,dest)
                     save_log("FILE DELETED", f"File: {fname} | Warehouse: [YK] | Moved to dump: {dest}")
             except Exception as e: failed.append(f"{fname}: {e}")
@@ -5760,16 +5827,15 @@ def generate_qr_pdf(items_batch, custom_name=None):
                 ("Hostname:",   str(item.get("Hostname", ""))),
                 ("Serial No:",  str(item.get("Serial Number", ""))),
                 ("Checked By:", str(item.get("Checked By", ""))),
-                ("Date:",       str(item.get("_date", datetime.now().strftime("%Y-%m-%d")))),
+                ("Date:",       str(item.get("_date", _now().strftime("%Y-%m-%d")))),
             ]
             qr_key = f"{item.get('Set ID', '')}-{item.get('Equipment Type', '')}"
             path   = qr_path_for(qr_key, warehouse=2)
         else:
             fields = [
                 ("Hostname:",   str(item.get("Hostname", ""))),
-                ("Serial No:",  str(item.get("Serial Number", ""))),
                 ("Checked By:", str(item.get("Checked By", ""))),
-                ("Date:",       str(item.get("_date", datetime.now().strftime("%Y-%m-%d")))),
+                ("Date:",       str(item.get("_date", _now().strftime("%Y-%m-%d")))),
             ]
             path = qr_path_for(item.get('Hostname', ''), warehouse=1)
 
@@ -5810,7 +5876,7 @@ def generate_qr_pdf(items_batch, custom_name=None):
     pdf.output(pdf_path)
 
     # ── Stamp date on new items before saving to sidecar ──
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _now().strftime("%Y-%m-%d")
     for it in new_items:
         it.setdefault("_date", today)
 
@@ -5896,7 +5962,7 @@ def open_label_manager(warehouse=None):
         row_data.clear()
         check_vars.clear()
 
-        now = datetime.now()
+        now = _now()
         all_warehouses = [("Warehouse 1", QR_LABELS_FOLDER_W1), ("Warehouse 2", QR_LABELS_FOLDER_W2)]
         filtered = [(wl, f) for wl, f in all_warehouses if warehouse is None or wl == f"Warehouse {warehouse}"]
 
@@ -5994,7 +6060,7 @@ def open_label_manager(warehouse=None):
                     if os.path.exists(dest):
                         base, ext = os.path.splitext(fname)
                         dest = os.path.join(dump_folder,
-                                            f"{base}_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}")
+                                            f"{base}_{_now().strftime('%Y%m%d%H%M%S')}{ext}")
                     shutil.move(full_path, dest)
                     save_log("FILE DELETED", f"File: {fname} | Warehouse: {'[W1]' if warehouse == 1 else '[W2]'} | Moved to dump: {dest}")
                     sidecar = full_path + ".keys.json"
@@ -6304,7 +6370,7 @@ def switch_user():
         save_log("LOGOUT", f"Session ended for '{current_user}'")
         current_user     = uname
         current_is_admin = (role == "admin")
-        session_start    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session_start    = _now().strftime("%Y-%m-%d %H:%M:%S")
         _refresh_user_bar()
         save_log("LOGIN", f"Session started by '{current_user}' (role: {role})")
         sw_win.destroy()
@@ -6374,7 +6440,7 @@ def show_login():
             error_label.config(text="Invalid username or password."); return
         current_user     = uname
         current_is_admin = (role == "admin")
-        session_start    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session_start    = _now().strftime("%Y-%m-%d %H:%M:%S")
         login_win.quit()
 
     btn_row = tk.Frame(login_win, padx=30)
@@ -6662,7 +6728,7 @@ session_label = tk.Label(user_bar, text=f"Session started: {session_start}", bg=
 session_label.pack(side="left", padx=5, pady=4)
 
 def update_clock():
-    clock_label.config(text=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    clock_label.config(text=_now().strftime("%Y-%m-%d %H:%M:%S"))
     root.after(1000, update_clock)
 update_clock()
 
@@ -6738,6 +6804,8 @@ staging_btn_frame = tk.Frame(input_frame)
 staging_btn_frame.grid(row=9, column=0, columnspan=2, pady=3)
 tip(tk.Button(staging_btn_frame, text="CLEAR ITEMS",   command=remove_from_staging, width=13),
     "Remove the selected staged item (or all if none selected).").pack(side="left", padx=2)
+tip(tk.Button(staging_btn_frame, text="↻", command=lambda: staged_listbox.selection_clear(0, tk.END), width=3),
+    "Deselect the current staged item so CLEAR ITEMS will clear all.").pack(side="left", padx=2)
 tip(tk.Button(staging_btn_frame, text="PUT WAREHOUSE", command=put_warehouse,       width=13),
     "Commit all staged items to Warehouse 1 and generate QR codes. Use GENERATE FILES to create PDF labels.").pack(side="left", padx=2)
 
@@ -6967,6 +7035,8 @@ w2_stage_btns = tk.Frame(w2_input_frame)
 w2_stage_btns.grid(row=6, column=0, columnspan=2, pady=3)
 tip(tk.Button(w2_stage_btns, text="CLEAR SETS",    command=w2_remove_staged_set, width=13),
     "Remove the selected staged set (or all sets if none selected).").pack(side="left", padx=2)
+tip(tk.Button(w2_stage_btns, text="↻", command=lambda: w2_staged_listbox.selection_clear(0, tk.END), width=3),
+    "Deselect the current staged set so CLEAR SETS will clear all.").pack(side="left", padx=2)
 tip(tk.Button(w2_stage_btns, text="PUT WAREHOUSE", command=w2_put_warehouse,     width=13),
     "Commit all staged sets to Warehouse 2 and generate QR codes. Use GENERATE FILES to create PDF labels.").pack(side="left", padx=2)
 
@@ -7254,6 +7324,8 @@ yk_stage_action_row = tk.Frame(yk_input_frame)
 yk_stage_action_row.pack(pady=3)
 tip(tk.Button(yk_stage_action_row, text="CLEAR ITEMS",   command=yk_remove_from_staging, width=13),
     "Remove selected staged item, or all items if none selected.").pack(side="left", padx=2)
+tip(tk.Button(yk_stage_action_row, text="↻", command=lambda: yk_staged_listbox.selection_clear(0, tk.END), width=3),
+    "Deselect the current staged item so CLEAR ITEMS will clear all.").pack(side="left", padx=2)
 tip(tk.Button(yk_stage_action_row, text="PUT WAREHOUSE", command=yk_put_warehouse,       width=13),
     "Commit all staged items to the Yubikey warehouse and generate QR codes.").pack(side="left", padx=2)
 
